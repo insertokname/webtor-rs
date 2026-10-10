@@ -1,52 +1,41 @@
-//! Async KCP stream wrapper
+//! Async KCP stream wrapper (Snowflake / Turbo Tunnel reliability layer)
 //!
-//! This module provides an async wrapper around the `kcp` crate that works
-//! with any AsyncRead + AsyncWrite transport (not just UDP sockets).
+//! Glue between the `kcp` crate and any AsyncRead + AsyncWrite transport.
 //!
-//! KCP provides reliable, ordered delivery over an unreliable transport.
+//! Rewritten: the previous glue lost data under normal
+//! conditions, which made long-lived connections stall after a few minutes:
+//! - KCP output was dropped when the transport was not immediately writable,
+//! - a retried `poll_write` re-queued bytes KCP had already accepted,
+//! - KCP timers (retransmission, window probes) only ran when the application
+//!   happened to read or write,
+//! - reads with a buffer smaller than a KCP segment failed with UserBufTooSmall.
 //!
-//! Data flow:
-//! - send() -> snd_queue -> update() -> flush() -> output -> transport
-//! - transport -> input() -> rcv_buf -> recv() -> application
+//! This version follows the standard pattern (as in kcp-go, used by Snowflake):
+//! - every KCP output packet is queued and written in order, never dropped;
+//! - `poll_write` only returns Pending *before* KCP accepts data;
+//! - `kcp.update` is driven by a timer, at the deadline `kcp.check` reports;
+//! - received segments are buffered so callers may read with any buffer size;
+//! - a dead link (too many retransmissions) is reported as an error instead of
+//!   stalling silently, so upper layers can reconnect.
 
-use crate::error::{Result, TorError};
 use crate::time::Instant;
-use futures::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use futures::{AsyncRead, AsyncWrite};
 use kcp::Kcp;
+use std::collections::VecDeque;
+use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
-use tracing::{debug, trace};
 
-/// Output buffer that collects data from KCP for sending
-#[derive(Clone)]
-struct OutputBuffer {
-    data: Arc<Mutex<Vec<u8>>>,
-}
+/// Collects KCP output, one entry per packet (packet boundaries preserved).
+#[derive(Clone, Default)]
+struct OutputQueue(Arc<Mutex<VecDeque<Vec<u8>>>>);
 
-impl OutputBuffer {
-    fn new() -> Self {
-        Self {
-            data: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn take(&self) -> Vec<u8> {
-        let mut data = self.data.lock().unwrap();
-        std::mem::take(&mut *data)
-    }
-
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.data.lock().unwrap().is_empty()
-    }
-}
-
-impl Write for OutputBuffer {
+impl Write for OutputQueue {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.data.lock().unwrap().extend_from_slice(buf);
+        self.0.lock().unwrap().push_back(buf.to_vec());
         Ok(buf.len())
     }
 
@@ -58,13 +47,13 @@ impl Write for OutputBuffer {
 /// KCP configuration
 #[derive(Debug, Clone)]
 pub struct KcpConfig {
-    /// Conversation ID (must match on both ends)
+    /// Conversation ID (must match on both sides)
     pub conv: u32,
-    /// Enable nodelay mode for faster retransmission
+    /// Enable nodelay mode
     pub nodelay: bool,
     /// Update interval in milliseconds
     pub interval: i32,
-    /// Fast resend trigger (0 = off, 2 = on duplicate ACK)
+    /// Fast resend trigger count (0 = disabled)
     pub resend: i32,
     /// Disable congestion control
     pub nc: bool,
@@ -78,43 +67,48 @@ impl Default for KcpConfig {
     fn default() -> Self {
         Self {
             conv: 0,
-            // Match Snowflake Go client settings:
-            // conn.SetNoDelay(0, 0, 0, 1) means:
-            // nodelay=0 (default), interval=0 (default 100ms), resend=0 (off), nc=1 (congestion off)
+            // Match Snowflake Go settings: nodelay=false, interval=100, nc=true
             nodelay: false,
-            interval: 100, // Default KCP interval
-            resend: 0,     // No fast resend
-            nc: true,      // Disable congestion control (nc=1 in Go)
+            interval: 100,
+            resend: 0,
+            nc: true,
             snd_wnd: 128,
             rcv_wnd: 128,
         }
     }
 }
 
-/// Async KCP stream
+type Timer = Pin<Box<dyn Future<Output = ()>>>;
+
+/// Async KCP stream over an arbitrary transport
 pub struct KcpStream<S> {
-    kcp: Kcp<OutputBuffer>,
-    output: OutputBuffer,
+    kcp: Kcp<OutputQueue>,
+    output: OutputQueue,
     transport: S,
-    #[allow(dead_code)]
-    read_buffer: Vec<u8>,
-    #[allow(dead_code)]
-    recv_buffer: Vec<u8>,
     start_time: Instant,
-    #[allow(dead_code)]
-    last_update: u32,
-    waker: Option<Waker>,
-    /// Pending output data that needs to be written to transport
-    pending_write: Vec<u8>,
+    /// Fires when KCP next needs `update` (retransmissions, window probes, flushes)
+    timer: Option<Timer>,
+    /// Task waiting for send-window space
+    write_waker: Option<Waker>,
+    /// Maximum bytes waiting in KCP's send queue before applying backpressure
+    snd_limit: usize,
+    /// Scratch buffer for transport reads
+    rx_scratch: Vec<u8>,
+    /// Received data not yet handed to the caller
+    rx_pending: Vec<u8>,
+    rx_pos: usize,
+    transport_eof: bool,
+}
+
+fn kcp_err(e: kcp::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, format!("KCP error: {:?}", e))
 }
 
 impl<S> KcpStream<S> {
+    /// Create a new KCP stream over the given transport
     pub fn new(transport: S, config: KcpConfig) -> Self {
-        let output = OutputBuffer::new();
-        // Use stream mode like Snowflake Go client (SetStreamMode(true))
+        let output = OutputQueue::default();
         let mut kcp = Kcp::new_stream(config.conv, output.clone());
-
-        // Configure KCP to match Snowflake Go client settings
         kcp.set_nodelay(config.nodelay, config.interval, config.resend, config.nc);
         kcp.set_wndsize(config.snd_wnd, config.rcv_wnd);
 
@@ -122,139 +116,69 @@ impl<S> KcpStream<S> {
             kcp,
             output,
             transport,
-            read_buffer: Vec::with_capacity(4096),
-            recv_buffer: vec![0u8; 65536],
             start_time: Instant::now(),
-            last_update: 0,
-            waker: None,
-            pending_write: Vec::new(),
+            timer: None,
+            write_waker: None,
+            snd_limit: 2 * config.snd_wnd as usize,
+            rx_scratch: vec![0u8; 65536],
+            rx_pending: Vec::new(),
+            rx_pos: 0,
+            transport_eof: false,
         }
     }
 
-    fn current_ms(&self) -> u32 {
+    fn now_ms(&self) -> u32 {
         self.start_time.elapsed().as_millis() as u32
+    }
+
+    /// Run KCP's periodic work if it is due, and arm the timer for the next deadline.
+    fn poll_timer(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        loop {
+            if let Some(timer) = self.timer.as_mut() {
+                if timer.as_mut().poll(cx).is_pending() {
+                    return Ok(());
+                }
+                self.timer = None;
+            }
+            self.kcp.update(self.now_ms()).map_err(kcp_err)?;
+            if self.kcp.is_dead_link() {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "KCP link is dead (too many retransmissions)",
+                ));
+            }
+            let wait_ms = self.kcp.check(self.now_ms()).max(1) as u64;
+            self.timer = Some(Box::pin(crate::retry::sleep(Duration::from_millis(wait_ms))));
+            // Loop once more to poll the new timer, which registers our waker.
+        }
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> KcpStream<S> {
-    /// Update KCP state and flush pending data
-    async fn update_and_flush(&mut self) -> Result<()> {
-        let current = self.current_ms();
-
-        // Update KCP (handles retransmission, ACKs, etc.)
-        self.kcp
-            .update(current)
-            .map_err(|e| TorError::Protocol(format!("KCP update error: {:?}", e)))?;
-
-        self.last_update = current;
-
-        // Flush output to transport
-        self.flush_output().await?;
-
-        Ok(())
-    }
-
-    /// Flush KCP output buffer to transport
-    async fn flush_output(&mut self) -> Result<()> {
-        let data = self.output.take();
-        if !data.is_empty() {
-            trace!("KCP sending {} bytes to transport", data.len());
-            self.transport
-                .write_all(&data)
-                .await
-                .map_err(|e| TorError::Network(format!("KCP transport write error: {}", e)))?;
-            self.transport
-                .flush()
-                .await
-                .map_err(|e| TorError::Network(format!("KCP transport flush error: {}", e)))?;
-        }
-        Ok(())
-    }
-
-    /// Process incoming data from transport
-    async fn process_input(&mut self) -> Result<bool> {
-        // Try to read from transport
-        let mut temp = [0u8; 4096];
-
-        // Non-blocking read attempt using poll
-        let n = match futures::future::poll_fn(|cx| {
-            Pin::new(&mut self.transport).poll_read(cx, &mut temp)
-        })
-        .await
-        {
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
-            Err(e) => {
-                return Err(TorError::Network(format!(
-                    "KCP transport read error: {}",
-                    e
-                )))
-            }
-        };
-
-        if n == 0 {
-            return Ok(false); // EOF
-        }
-
-        trace!("KCP received {} bytes from transport", n);
-
-        // Feed to KCP
-        self.kcp
-            .input(&temp[..n])
-            .map_err(|e| TorError::Protocol(format!("KCP input error: {:?}", e)))?;
-
-        Ok(true)
-    }
-
-    /// Send data through KCP
-    pub async fn send(&mut self, data: &[u8]) -> Result<usize> {
-        let sent = self
-            .kcp
-            .send(data)
-            .map_err(|e| TorError::Protocol(format!("KCP send error: {:?}", e)))?;
-
-        // Immediately try to flush
-        self.update_and_flush().await?;
-
-        Ok(sent)
-    }
-
-    /// Receive data from KCP
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+impl<S: AsyncWrite + Unpin> KcpStream<S> {
+    /// Write queued KCP packets to the transport, in order, without dropping any.
+    /// Ready(Ok) once everything is written and flushed; Pending if the transport
+    /// is not writable yet (packets stay queued).
+    fn poll_drain_output(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
-            // Try to receive from KCP
-            match self.kcp.recv(buf) {
-                Ok(n) => return Ok(n),
-                Err(kcp::Error::RecvQueueEmpty) => {
-                    // Need more data - process input and update
+            let packet = match self.output.0.lock().unwrap().front() {
+                Some(packet) => packet.clone(),
+                None => break,
+            };
+            match Pin::new(&mut self.transport).poll_write(cx, &packet) {
+                Poll::Ready(Ok(n)) if n == packet.len() => {
+                    self.output.0.lock().unwrap().pop_front();
                 }
-                Err(e) => return Err(TorError::Protocol(format!("KCP recv error: {:?}", e))),
-            }
-
-            // Process any incoming data
-            self.process_input().await?;
-
-            // Update KCP state
-            self.update_and_flush().await?;
-
-            // Check how long until next update
-            let check = self.kcp.check(self.current_ms());
-            if check > 0 {
-                // Wait a bit before trying again
-                #[cfg(not(target_arch = "wasm32"))]
-                tokio::time::sleep(Duration::from_millis(check.min(10) as u64)).await;
-
-                #[cfg(target_arch = "wasm32")]
-                {
-                    use crate::wasm_runtime::WasmRuntime;
-                    use tor_rtcompat::SleepProvider;
-                    let runtime = WasmRuntime::new();
-                    runtime
-                        .sleep(Duration::from_millis(check.min(10) as u64))
-                        .await;
+                Poll::Ready(Ok(n)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!("transport accepted {} of {} bytes of a KCP packet", n, packet.len()),
+                    )))
                 }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         }
+        Pin::new(&mut self.transport).poll_flush(cx)
     }
 }
 
@@ -264,92 +188,63 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for KcpStream<S> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        // Save waker for later
-        self.waker = Some(cx.waker().clone());
+        let this = &mut *self;
 
-        // Try to receive from KCP first
-        match self.kcp.recv(buf) {
-            Ok(n) => {
-                debug!("KCP read: received {} bytes from KCP queue", n);
-                return Poll::Ready(Ok(n));
-            }
-            Err(kcp::Error::RecvQueueEmpty) => {}
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("KCP recv error: {:?}", e),
-                )))
+        // 1. Feed every packet the transport has ready into KCP.
+        let mut got_input = false;
+        while !this.transport_eof {
+            match Pin::new(&mut this.transport).poll_read(cx, &mut this.rx_scratch) {
+                Poll::Ready(Ok(0)) => this.transport_eof = true,
+                Poll::Ready(Ok(n)) => {
+                    this.kcp.input(&this.rx_scratch[..n]).map_err(kcp_err)?;
+                    got_input = true;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => break,
             }
         }
 
-        // Need more data from transport
-        let mut temp = [0u8; 4096];
-        match Pin::new(&mut self.transport).poll_read(cx, &mut temp) {
-            Poll::Ready(Ok(0)) => {
-                debug!("KCP read: transport EOF");
-                Poll::Ready(Ok(0))
+        // 2. Timers (also performs KCP's first `update`, required before flushing).
+        this.poll_timer(cx)?;
+
+        if got_input {
+            // Acknowledge promptly, and let a blocked writer retry: ACKs free window space.
+            this.kcp.flush_ack().map_err(kcp_err)?;
+            if let Some(waker) = this.write_waker.take() {
+                waker.wake();
             }
-            Poll::Ready(Ok(n)) => {
-                debug!("KCP read: got {} bytes from transport, feeding to KCP", n);
-                // Feed to KCP
-                if let Err(e) = self.kcp.input(&temp[..n]) {
-                    debug!("KCP read: input error: {:?}", e);
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("KCP input error: {:?}", e),
-                    )));
-                }
+        }
 
-                // Update KCP
-                let current = self.current_ms();
-                if let Err(e) = self.kcp.update(current) {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("KCP update error: {:?}", e),
-                    )));
-                }
+        // 3. Send whatever KCP produced (ACKs, retransmissions). Pending is fine here:
+        //    packets stay queued and we are woken when the transport is writable.
+        if let Poll::Ready(Err(e)) = this.poll_drain_output(cx) {
+            return Poll::Ready(Err(e));
+        }
 
-                // Write any output that update generated (ACKs, etc.)
-                // We need to send ACKs immediately or the sender will retransmit
-                let output_data = self.output.take();
-                if !output_data.is_empty() {
-                    debug!(
-                        "KCP read: sending {} bytes of KCP output (ACKs)",
-                        output_data.len()
-                    );
-                    // Try to write ACKs immediately
-                    if let Poll::Ready(Err(e)) =
-                        Pin::new(&mut self.transport).poll_write(cx, &output_data)
-                    {
-                        return Poll::Ready(Err(e));
-                    }
-                    // Also try to flush
-                    let _ = Pin::new(&mut self.transport).poll_flush(cx);
+        // 4. Hand received data to the caller, buffering whole KCP segments.
+        if this.rx_pos == this.rx_pending.len() {
+            this.rx_pending.clear();
+            this.rx_pos = 0;
+            match this.kcp.peeksize() {
+                Ok(size) => {
+                    this.rx_pending.resize(size, 0);
+                    let n = this.kcp.recv(&mut this.rx_pending).map_err(kcp_err)?;
+                    this.rx_pending.truncate(n);
                 }
-
-                // Try recv again
-                match self.kcp.recv(buf) {
-                    Ok(n) => {
-                        debug!("KCP read: received {} bytes after input", n);
-                        Poll::Ready(Ok(n))
-                    }
-                    Err(kcp::Error::RecvQueueEmpty) => {
-                        debug!("KCP read: recv queue still empty, pending");
-                        cx.waker().wake_by_ref();
+                Err(kcp::Error::RecvQueueEmpty) | Err(kcp::Error::ExpectingFragment) => {
+                    return if this.transport_eof {
+                        Poll::Ready(Ok(0))
+                    } else {
                         Poll::Pending
-                    }
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("KCP recv error: {:?}", e),
-                    ))),
+                    };
                 }
+                Err(e) => return Poll::Ready(Err(kcp_err(e))),
             }
-            Poll::Ready(Err(e)) => {
-                debug!("KCP read: transport error: {}", e);
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => Poll::Pending,
         }
+        let n = buf.len().min(this.rx_pending.len() - this.rx_pos);
+        buf[..n].copy_from_slice(&this.rx_pending[this.rx_pos..this.rx_pos + n]);
+        this.rx_pos += n;
+        Poll::Ready(Ok(n))
     }
 }
 
@@ -359,115 +254,36 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for KcpStream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        debug!("KCP write: sending {} bytes", buf.len());
+        let this = &mut *self;
 
-        // Queue data in KCP
-        match self.kcp.send(buf) {
-            Ok(n) => {
-                debug!("KCP write: queued {} bytes in KCP", n);
-
-                // Update KCP state first (required before flush)
-                let current = self.current_ms();
-                if let Err(e) = self.kcp.update(current) {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("KCP update error: {:?}", e),
-                    )));
-                }
-
-                // Force flush to produce output immediately
-                if let Err(e) = self.kcp.flush() {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("KCP flush error: {:?}", e),
-                    )));
-                }
-
-                // Flush output
-                let output_data = self.output.take();
-                if !output_data.is_empty() {
-                    debug!(
-                        "KCP write: flushing {} bytes to transport",
-                        output_data.len()
-                    );
-                    match Pin::new(&mut self.transport).poll_write(cx, &output_data) {
-                        Poll::Ready(Ok(written)) => {
-                            debug!("KCP write: wrote {} bytes to transport", written);
-                            Poll::Ready(Ok(n))
-                        }
-                        Poll::Ready(Err(e)) => {
-                            debug!("KCP write: transport error: {}", e);
-                            Poll::Ready(Err(e))
-                        }
-                        Poll::Pending => {
-                            debug!("KCP write: transport pending");
-                            Poll::Pending
-                        }
-                    }
-                } else {
-                    debug!("KCP write: no output to flush");
-                    Poll::Ready(Ok(n))
-                }
+        // Backpressure: refuse new data (before accepting any) while the send queue is full.
+        if this.kcp.wait_snd() >= this.snd_limit {
+            if let Poll::Ready(Err(e)) = this.poll_drain_output(cx) {
+                return Poll::Ready(Err(e));
             }
-            Err(e) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("KCP send error: {:?}", e),
-            ))),
+            this.write_waker = Some(cx.waker().clone());
+            return Poll::Pending;
         }
+
+        // From here on the data is accepted: never return Pending.
+        let n = this.kcp.send(buf).map_err(kcp_err)?;
+        this.kcp.update(this.now_ms()).map_err(kcp_err)?;
+        this.kcp.flush().map_err(kcp_err)?;
+        if let Poll::Ready(Err(e)) = this.poll_drain_output(cx) {
+            return Poll::Ready(Err(e));
+        }
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // First, write any pending data (ACKs from poll_read)
-        if !self.pending_write.is_empty() {
-            let data = std::mem::take(&mut self.pending_write);
-            debug!("KCP flush: writing {} bytes of pending data", data.len());
-            match Pin::new(&mut self.transport).poll_write(cx, &data) {
-                Poll::Ready(Ok(n)) if n == data.len() => {}
-                Poll::Ready(Ok(n)) => {
-                    // Partial write - save remaining
-                    self.pending_write = data[n..].to_vec();
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    self.pending_write = data;
-                    return Poll::Pending;
-                }
-            }
-        }
-
-        // Flush KCP output
-        let _current = self.current_ms();
-        if let Err(e) = self.kcp.flush() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("KCP flush error: {:?}", e),
-            )));
-        }
-
-        // Flush output buffer from KCP flush
-        let output_data = self.output.take();
-        if !output_data.is_empty() {
-            debug!("KCP flush: writing {} bytes from KCP", output_data.len());
-            match Pin::new(&mut self.transport).poll_write(cx, &output_data) {
-                Poll::Ready(Ok(_)) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        Pin::new(&mut self.transport).poll_flush(cx)
+        self.poll_drain_output(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Flush before closing
-        match self.as_mut().poll_flush(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
+        match self.poll_drain_output(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.transport).poll_close(cx),
+            other => other,
         }
-
-        Pin::new(&mut self.transport).poll_close(cx)
     }
 }
 
@@ -485,13 +301,14 @@ mod tests {
     }
 
     #[test]
-    fn test_output_buffer() {
-        let mut buf = OutputBuffer::new();
-        buf.write_all(b"hello").unwrap();
-        buf.write_all(b" world").unwrap();
+    fn test_output_queue_preserves_packets() {
+        let mut queue = OutputQueue::default();
+        queue.write_all(b"first").unwrap();
+        queue.write_all(b"second").unwrap();
 
-        let data = buf.take();
-        assert_eq!(data, b"hello world");
-        assert!(buf.is_empty());
+        let packets = queue.0.lock().unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0], b"first");
+        assert_eq!(packets[1], b"second");
     }
 }

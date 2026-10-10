@@ -949,11 +949,13 @@ pub fn init() -> Result<(), JsValue> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let wasm_layer = tracing_wasm::WASMLayer::new(tracing_wasm::WASMLayerConfig::default());
+    // The default tracing-wasm layer logs every TRACE event to the
+    // console (plus a performance mark), which is far too heavy for long runs.
+    // Forward INFO and above to the JS callback only.
     let js_layer = JsLogLayer;
 
     tracing_subscriber::registry()
-        .with(wasm_layer)
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
         .with(js_layer)
         .init();
 
@@ -978,4 +980,89 @@ pub fn get_version_info() -> JsValue {
         "tor_proto": env!("TOR_PROTO_VERSION"),
     });
     serde_wasm_bindgen::to_value(&info).unwrap_or(JsValue::NULL)
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket to a Signal server through Tor
+// ---------------------------------------------------------------------------
+
+use futures::lock::Mutex as AsyncMutex;
+use futures::stream::{SplitSink, SplitStream};
+use futures::{SinkExt, StreamExt};
+use webtor::signal_socket::{Message, SignalWebSocket};
+
+/// A binary WebSocket to a Signal server, tunnelled through Tor.
+#[wasm_bindgen]
+pub struct SignalSocket {
+    sink: std::rc::Rc<AsyncMutex<SplitSink<SignalWebSocket, Message>>>,
+    stream: std::rc::Rc<AsyncMutex<SplitStream<SignalWebSocket>>>,
+}
+
+#[wasm_bindgen]
+impl SignalSocket {
+    /// Open `url` (wss://...) through `client`, trusting ONLY `root_pem`.
+    /// Resolves to a SignalSocket, or to a number (the HTTP status) when the
+    /// server refuses the upgrade.
+    pub fn open(
+        client: &TorClient,
+        url: String,
+        root_pem: String,
+        authorization: Option<String>,
+    ) -> js_sys::Promise {
+        let client = client.inner.clone();
+        future_to_promise(async move {
+            let client = client.ok_or_else(|| JsTorError::not_initialized().into_js_value())?;
+            match webtor::signal_socket::open(&client, &url, &root_pem, authorization.as_deref()).await {
+                Ok(Ok(ws)) => {
+                    let (sink, stream) = ws.split();
+                    Ok(JsValue::from(SignalSocket {
+                        sink: std::rc::Rc::new(AsyncMutex::new(sink)),
+                        stream: std::rc::Rc::new(AsyncMutex::new(stream)),
+                    }))
+                }
+                Ok(Err(status)) => Ok(JsValue::from(status)),
+                Err(e) => Err(tor_error_to_js(e)),
+            }
+        })
+    }
+
+    /// Send one binary message.
+    pub fn send(&self, data: Vec<u8>) -> js_sys::Promise {
+        let sink = self.sink.clone();
+        future_to_promise(async move {
+            sink.lock()
+                .await
+                .send(Message::Binary(data))
+                .await
+                .map_err(|e| JsValue::from_str(&format!("send failed: {}", e)))?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    /// Receive the next binary message; resolves to null when the socket closes.
+    pub fn recv(&self) -> js_sys::Promise {
+        let stream = self.stream.clone();
+        future_to_promise(async move {
+            let mut stream = stream.lock().await;
+            loop {
+                match stream.next().await {
+                    Some(Ok(Message::Binary(data))) => {
+                        return Ok(js_sys::Uint8Array::from(&data[..]).into())
+                    }
+                    Some(Ok(Message::Close(_))) | None => return Ok(JsValue::NULL),
+                    Some(Ok(_)) => continue, // ping/pong/text: not part of Signal's protocol
+                    Some(Err(e)) => return Err(JsValue::from_str(&format!("recv failed: {}", e))),
+                }
+            }
+        })
+    }
+
+    /// Close the socket.
+    pub fn close(&self) -> js_sys::Promise {
+        let sink = self.sink.clone();
+        future_to_promise(async move {
+            let _ = sink.lock().await.close().await;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
 }

@@ -71,6 +71,12 @@ gloo-timers = { workspace = true }
 # WASM TLS (SubtleCrypto-based)
 subtle-tls = { path = "../subtle-tls" }
 async-trait = "0.1"
+# Real TLS (rustls + ring) and WebSocket (tungstenite) for connections to Signal servers
+rustls = { workspace = true }
+futures-rustls = { workspace = true }
+rustls-pki-types = { version = "1.13", features = ["web"] }
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+async-tungstenite = { version = "0.28", default-features = false, features = ["handshake", "futures-03-sink"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Native TLS (non-WASM only) - ring doesn't compile to WASM

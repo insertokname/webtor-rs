@@ -30,6 +30,12 @@ pub mod webtunnel;
 #[cfg(target_arch = "wasm32")]
 pub mod webrtc_stream;
 
+#[cfg(target_arch = "wasm32")]
+pub mod signal_socket;
+
+#[cfg(target_arch = "wasm32")]
+pub use subtle_tls;
+
 pub use client::TorClient;
 pub use config::TorClientOptions;
 pub use error::{Result, TorError, TorErrorKind};

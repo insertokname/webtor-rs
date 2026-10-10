@@ -172,14 +172,16 @@ impl RecordLayer {
                 cipher.increment_sequence();
 
                 // TLS 1.3: plaintext format is [content][content_type][zeros...]
-                // The content type is the last byte. We don't strip padding zeros because
-                // legitimate content data can end with zeros (e.g., DER-encoded certificates).
-                if plaintext.is_empty() {
-                    return Err(TlsError::record("Empty decrypted record"));
-                }
+                // RFC 8446 §5.4: the content type is the last
+                // NON-ZERO byte; trailing zeros are padding and must be stripped.
+                // This is unambiguous because the (non-zero) type byte always follows
+                // the content. chat.signal.org pads its records; most sites don't.
+                let type_pos = plaintext.iter().rposition(|&b| b != 0).ok_or_else(|| {
+                    TlsError::record("Decrypted record has no content type (all zeros)")
+                })?;
 
-                let actual_content_type = plaintext[plaintext.len() - 1];
-                let data = plaintext[..plaintext.len() - 1].to_vec();
+                let actual_content_type = plaintext[type_pos];
+                let data = plaintext[..type_pos].to_vec();
 
                 trace!(
                     "Decrypted record: type={}, len={}",

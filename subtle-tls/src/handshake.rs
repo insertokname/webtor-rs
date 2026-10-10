@@ -56,6 +56,7 @@ pub const GROUP_X25519: u16 = 0x001d;
 pub const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 pub const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 pub const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
+pub const SIG_ED25519: u16 = 0x0807;
 
 /// Key exchange state - supports both P-256 and X25519
 pub enum KeyExchangeState {
@@ -306,6 +307,7 @@ impl HandshakeState {
 
     fn build_signature_algorithms_extension(&self) -> Vec<u8> {
         let algorithms = [
+            SIG_ED25519,
             SIG_ECDSA_SECP256R1_SHA256,
             SIG_RSA_PSS_RSAE_SHA256,
             SIG_RSA_PKCS1_SHA256,

@@ -370,6 +370,31 @@ impl TorClient {
         info!("Tor client closed");
     }
 
+    /// Open a TCP stream through Tor to `host:port` and run
+    /// rustls over it with the given client config (caller controls trust roots).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn open_tls(
+        &self,
+        host: &str,
+        port: u16,
+        config: std::sync::Arc<rustls::ClientConfig>,
+    ) -> Result<futures_rustls::client::TlsStream<tor_proto::client::stream::DataStream>> {
+        let circuit = {
+            let circuit_manager = self.circuit_manager.read().await;
+            circuit_manager.get_circuit_for_isolation_key(None).await?
+        };
+        let stream = {
+            let circuit_read = circuit.read().await;
+            circuit_read.begin_stream(host, port).await?
+        };
+        let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| TorError::tls(format!("invalid server name {}: {}", host, e)))?;
+        futures_rustls::TlsConnector::from(config)
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| TorError::tls(format!("TLS with {} failed: {}", host, e)))
+    }
+
     /// Abort all in-flight operations.
     ///
     /// This cancels long-running operations like circuit creation and HTTP requests.

@@ -26,6 +26,15 @@ const DEFAULT_STREAM_ID: u32 = 3;
 /// Default window size (64KB)
 const DEFAULT_WINDOW: u32 = 65535;
 
+/// Receive window we advertise to the peer. 64 KB capped
+/// throughput at ~64 KB per round trip, which is very slow through Tor.
+const RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
+
+/// Send a window update (UPD) after consuming this many
+/// bytes. Must stay well below smux-go's initial peer window (256 KB), or the
+/// sender stalls before our first update arrives.
+const UPD_THRESHOLD: u32 = 32 * 1024;
+
 /// SMUX commands
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -204,7 +213,7 @@ impl SmuxState {
             self_read: 0,
             self_write: 0,
             self_increment: 0,
-            self_window: DEFAULT_WINDOW,
+            self_window: RECEIVE_WINDOW,
             peer_consumed: 0,
             peer_window: DEFAULT_WINDOW,
             syn_sent: false,
@@ -220,7 +229,7 @@ impl SmuxState {
 
     /// Check if we should send a window update
     fn should_send_update(&self) -> bool {
-        self.self_increment >= self.self_window / 2
+        self.self_increment >= UPD_THRESHOLD
     }
 }
 
@@ -230,6 +239,8 @@ pub struct SmuxStream<S> {
     state: SmuxState,
     read_buffer: Vec<u8>,
     data_buffer: Vec<u8>,
+    /// Encoded control frames (UPD) waiting to be written
+    pending_out: Vec<u8>,
 }
 
 impl<S> SmuxStream<S> {
@@ -243,6 +254,29 @@ impl<S> SmuxStream<S> {
             state: SmuxState::new(stream_id),
             read_buffer: Vec::with_capacity(4096),
             data_buffer: Vec::new(),
+            pending_out: Vec::new(),
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> SmuxStream<S> {
+    /// Write queued control frames. The inner (KCP) stream
+    /// accepts a whole buffer or returns Pending before accepting anything.
+    fn poll_drain_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.pending_out.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        match Pin::new(&mut self.inner).poll_write(cx, &self.pending_out) {
+            Poll::Ready(Ok(n)) if n == self.pending_out.len() => {
+                self.pending_out.clear();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "Partial SMUX control frame write",
+            ))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -472,7 +506,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SmuxStream<S> {
     }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for SmuxStream<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SmuxStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -525,6 +559,21 @@ impl<S: AsyncRead + Unpin> AsyncRead for SmuxStream<S> {
                                 .state
                                 .self_increment
                                 .wrapping_add(segment.data.len() as u32);
+
+                            // Window updates must be sent from this path too, otherwise
+                            // the peer stops sending after ~256 KB (silent stall).
+                            if self.state.should_send_update() {
+                                let upd = SmuxSegment::upd(
+                                    self.state.stream_id,
+                                    self.state.self_read,
+                                    self.state.self_window,
+                                );
+                                self.pending_out.extend_from_slice(&upd.encode());
+                                self.state.self_increment = 0;
+                            }
+                            if let Poll::Ready(Err(e)) = self.poll_drain_pending(cx) {
+                                return Poll::Ready(Err(e));
+                            }
 
                             let len = std::cmp::min(buf.len(), segment.data.len());
                             buf[..len].copy_from_slice(&segment.data[..len]);
@@ -605,6 +654,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SmuxStream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // Queued control frames go first (nothing accepted yet).
+        match self.poll_drain_pending(cx) {
+            Poll::Ready(Ok(())) => {}
+            other => return other.map(|r| r.map(|()| 0)),
+        }
+
         // Check flow control
         if !self.state.can_send(buf.len()) {
             // For now, just try anyway - proper impl would wait
@@ -645,7 +700,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SmuxStream<S> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        match self.poll_drain_pending(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_flush(cx),
+            other => other,
+        }
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

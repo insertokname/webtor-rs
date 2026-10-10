@@ -238,6 +238,29 @@ impl CertificateVerifier {
             TlsError::certificate(format!("Failed to parse last certificate: {}", e))
         })?;
 
+        // Strict pinning mode: the chain must be signed by the pinned root
+        if let Some(pinned) = crate::trust_store::pinned_root() {
+            let (_, root) = X509Certificate::from_der(&pinned.der).map_err(|e| {
+                TlsError::certificate(format!("Failed to parse pinned root: {}", e))
+            })?;
+            if last_cert_der.as_slice() == pinned.der.as_slice() {
+                self.verify_signature(&root, &root).await?;
+            } else {
+                if last_cert.issuer() != root.subject() {
+                    return Err(TlsError::certificate(format!(
+                        "PINNING FAILED: chain ends at issuer '{}', pinned root is '{}'",
+                        last_cert.issuer(),
+                        root.subject()
+                    )));
+                }
+                self.verify_signature(&last_cert, &root).await.map_err(|e| {
+                    TlsError::certificate(format!("PINNING FAILED: bad signature: {}", e))
+                })?;
+            }
+            info!("Chain cryptographically verified against pinned root {}", root.subject());
+            return Ok(());
+        }
+
         // Check if the last cert is in our trust store
         if let Some(ref trust_store) = self.trust_store {
             if trust_store.is_trusted_root(last_cert_der) {
@@ -792,6 +815,7 @@ pub async fn verify_certificate_verify(
         0x0806 => ("RSA-PSS", "SHA-512"),           // rsa_pss_rsae_sha512
         0x0403 => ("ECDSA", "SHA-256"),             // ecdsa_secp256r1_sha256
         0x0503 => ("ECDSA", "SHA-384"),             // ecdsa_secp384r1_sha384
+        0x0807 => ("Ed25519", ""),                  // ed25519
         _ => {
             return Err(TlsError::certificate(format!(
                 "Unsupported signature algorithm: 0x{:04x}",
@@ -805,7 +829,10 @@ pub async fn verify_certificate_verify(
     // Build key import algorithm
     let key_algorithm = Object::new();
 
-    if algorithm_name.starts_with("RSA") {
+    if algorithm_name == "Ed25519" {
+        Reflect::set(&key_algorithm, &"name".into(), &"Ed25519".into())
+            .map_err(|_| TlsError::subtle_crypto("Failed to set algorithm name"))?;
+    } else if algorithm_name.starts_with("RSA") {
         Reflect::set(&key_algorithm, &"name".into(), &algorithm_name.into())
             .map_err(|_| TlsError::subtle_crypto("Failed to set algorithm name"))?;
 

@@ -308,6 +308,26 @@ pub fn get_trust_store() -> Result<TrustStore> {
     TrustStore::new()
 }
 
+// Strict pinning. When set, a chain is accepted ONLY if it is
+// cryptographically signed by this root; all lenient fallbacks are disabled.
+thread_local! {
+    static PINNED_ROOT: RefCell<Option<RootCertificate>> = RefCell::new(None);
+}
+
+/// Pin TLS verification to exactly one root CA (None = upstream behaviour)
+pub fn set_pinned_root_pem(pem: Option<&str>) -> Result<()> {
+    let root = match pem {
+        Some(p) => Some(RootCertificate::from_pem(p)?),
+        None => None,
+    };
+    PINNED_ROOT.with(|r| *r.borrow_mut() = root);
+    Ok(())
+}
+
+pub fn pinned_root() -> Option<RootCertificate> {
+    PINNED_ROOT.with(|r| r.borrow().clone())
+}
+
 /// Embedded root certificate count (for bundle size estimation)
 pub const EMBEDDED_ROOT_COUNT: usize = 3;
 /// Approximate size of embedded roots in bytes
