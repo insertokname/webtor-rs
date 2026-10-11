@@ -58,15 +58,18 @@ impl TorClient {
 
         let directory_manager = Arc::new(DirectoryManager::new(relay_manager_arc.clone()));
 
-        // Load cached consensus to populate relay manager
-        // This is essential for WASM where we need relays before we can fetch fresh consensus
-        info!("Loading cached consensus...");
+        // The verified directory snapshot served with the page. If it cannot
+        // be used, the directory is fetched through the bridge once the
+        // channel is up (establish_channel).
+        info!("Loading the Tor directory snapshot...");
         if let Err(e) = directory_manager
             .load_cached_consensus(options.directory_url.as_deref())
             .await
         {
-            error!("Failed to load cached consensus: {}", e);
-            return Err(e);
+            warn!(
+                "Tor directory snapshot not usable, will fetch through the bridge: {}",
+                e
+            );
         }
 
         let circuit_manager = Arc::new(RwLock::new(CircuitManager::new(
@@ -335,13 +338,13 @@ impl TorClient {
 
         // Return relay count
         let relay_manager = self.directory_manager.relay_manager.read().await;
-        Ok(relay_manager.relays.len())
+        Ok(relay_manager.relay_count())
     }
 
     /// Get consensus status string
     pub async fn get_consensus_status(&self) -> String {
         let relay_manager = self.directory_manager.relay_manager.read().await;
-        let count = relay_manager.relays.len();
+        let count = relay_manager.relay_count();
         if count == 0 {
             "No consensus loaded".to_string()
         } else {
@@ -545,9 +548,28 @@ impl TorClient {
         };
 
         // Store the channel to keep it alive
-        *self.channel.write().await = Some(chan);
+        *self.channel.write().await = Some(chan.clone());
 
         self.log("Channel established", LogType::Success);
+
+        if !self.directory_manager.has_directory().await {
+            self.log(
+                "Fetching the Tor directory through the bridge...",
+                LogType::Info,
+            );
+            if let Err(e) = self
+                .directory_manager
+                .fetch_and_process_consensus(chan)
+                .await
+            {
+                let reason = match self.directory_manager.snapshot_error() {
+                    Some(snapshot) => format!("snapshot: {snapshot}; from the bridge: {e}"),
+                    None => format!("from the bridge: {e}"),
+                };
+                self.log(&format!("Tor directory unusable: {reason}"), LogType::Error);
+                return Err(TorError::Directory(reason));
+            }
+        }
 
         // Now create the actual circuit through the Tor network
         self.log("Creating circuit through Tor network...", LogType::Info);

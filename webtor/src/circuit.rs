@@ -223,7 +223,7 @@ impl CircuitManager {
 
         // Log relay manager state
         let relay_manager = self.relay_manager.read().await;
-        let total_relays = relay_manager.relays.len();
+        let total_relays = relay_manager.relay_count();
         drop(relay_manager);
         info!("Relay manager has {} total relays", total_relays);
 
@@ -290,29 +290,17 @@ impl CircuitManager {
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         );
 
-        // Select relays
-        let relay_manager = self.relay_manager.read().await;
-        info!(
-            "Selecting relays from {} available",
-            relay_manager.relays.len()
-        );
-
-        // Middle
-        // Ensure we don't select the bridge as middle
-        let middle_criteria =
-            crate::relay::selection::middle_relays().without_fingerprint(&bridge_fingerprint);
-        debug!("Middle relay criteria: {:?}", middle_criteria);
-
-        let middle = match relay_manager.select_relay(&middle_criteria) {
-            Ok(r) => r,
-            Err(e) => {
-                error!(
-                    "Failed to select middle relay: {} (available: {})",
-                    e,
-                    relay_manager.relays.len()
-                );
-                return Err(e);
-            }
+        // Select relays (exit first, then a middle outside its family, as Arti does)
+        let (middle, exit) = {
+            let relay_manager = self.relay_manager.read().await;
+            info!(
+                "Selecting relays from {} available",
+                relay_manager.relay_count()
+            );
+            relay_manager.select_path(channel_target).map_err(|e| {
+                error!("Failed to select relays: {}", e);
+                e
+            })?
         };
         let middle_target = middle.as_circ_target()?;
 
@@ -334,24 +322,6 @@ impl CircuitManager {
             .await
             .map_err(|e| TorError::Internal(format!("Failed to extend to middle: {}", e)))?;
 
-        // Exit
-        // Ensure we don't select bridge or middle as exit
-        let exit_criteria = crate::relay::selection::exit_relays()
-            .without_fingerprint(&bridge_fingerprint)
-            .without_fingerprint(&middle.fingerprint);
-        debug!("Exit relay criteria: {:?}", exit_criteria);
-
-        let exit = match relay_manager.select_relay(&exit_criteria) {
-            Ok(r) => r,
-            Err(e) => {
-                error!(
-                    "Failed to select exit relay: {} (available: {})",
-                    e,
-                    relay_manager.relays.len()
-                );
-                return Err(e);
-            }
-        };
         let exit_target = exit.as_circ_target()?;
 
         info!(

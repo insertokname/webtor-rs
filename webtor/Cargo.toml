@@ -25,6 +25,9 @@ tor-proto = { workspace = true }
 tor-protover = { workspace = true }
 tor-units = { workspace = true }
 tor-netdoc = { workspace = true }
+tor-dircommon = { workspace = true }
+tor-netdir = { workspace = true }
+tor-relay-selection = { workspace = true }
 tor-linkspec = { workspace = true }
 tor-llcrypto = { workspace = true }
 tor-cell = { workspace = true }
@@ -59,10 +62,13 @@ flate2 = "1.0"
 brotli = "7.0"
 uuid = { version = "1.0", features = ["v4", "js"] }
 rand = { version = "0.8", features = ["std", "std_rng"] }
+# The rand version Arti's relay selection takes
+rand09 = { package = "rand", version = "0.9" }
 web-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }
 httparse = "1.10.1"
+humantime = "2"
 tor-checkable = "0.37.0"
 
 # KCP reliable transport

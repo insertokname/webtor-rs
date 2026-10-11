@@ -67,6 +67,11 @@ pub enum TorError {
     #[error("Consensus fetch failed: {0}")]
     ConsensusFetch(String),
 
+    /// The Tor directory did not verify (signatures, certificates, timeliness,
+    /// microdescriptor digests) or could not be fetched.
+    #[error("Tor directory: {0}")]
+    Directory(String),
+
     #[error("HTTP request failed: {0}")]
     HttpRequest(String),
 
@@ -182,6 +187,7 @@ impl TorError {
             TorError::CircuitExtension(_) => TorErrorKind::Circuit,
             TorError::RelaySelection(_) => TorErrorKind::Circuit,
             TorError::ConsensusFetch(_) => TorErrorKind::Bootstrap,
+            TorError::Directory(_) => TorErrorKind::Bootstrap,
             TorError::TorProtocol(_) => TorErrorKind::Protocol,
             TorError::TlsSetup(_) => TorErrorKind::Protocol,
             TorError::Protocol(_) => TorErrorKind::Protocol,
@@ -219,6 +225,8 @@ impl TorError {
 
             // Bootstrap/consensus issues might resolve (network conditions change)
             TorError::ConsensusFetch(_) => true,
+            // A newer snapshot or the bridge's copy may verify
+            TorError::Directory(_) => true,
 
             // Relay selection might work with different criteria or updated consensus
             TorError::RelaySelection(_) => true,
@@ -256,6 +264,7 @@ impl TorError {
             TorError::CircuitExtension(_) => "CIRCUIT_EXTENSION",
             TorError::RelaySelection(_) => "RELAY_SELECTION",
             TorError::ConsensusFetch(_) => "CONSENSUS_FETCH",
+            TorError::Directory(_) => "DIRECTORY",
             TorError::HttpRequest(_) => "HTTP_REQUEST",
             TorError::TlsSetup(_) => "TLS_SETUP",
             TorError::Timeout(_) => "TIMEOUT",

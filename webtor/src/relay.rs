@@ -1,14 +1,20 @@
 //! Tor relay management and selection
 
+use crate::directory::VerifiedDirectory;
 use crate::error::{Result, TorError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
-use tor_linkspec::OwnedCircTarget;
+use std::sync::Arc;
+use tor_linkspec::{ChanTarget, CircTarget, HasAddrs, OwnedCircTarget};
 use tor_llcrypto::pk::{
     curve25519::PublicKey as Curve25519PublicKey, ed25519::Ed25519Identity, rsa::RsaIdentity,
 };
+use tor_netdir::{FamilyRules, SubnetConfig};
 use tor_protover::Protocols;
+use tor_relay_selection::{
+    RelayExclusion, RelaySelectionConfig, RelaySelector, RelayUsage, TargetPort,
+};
 use tracing::{debug, info};
 
 /// Tor relay information
@@ -56,6 +62,38 @@ impl Relay {
             ed25519_identity: None,
             ntor_onion_key: Some(ntor_onion_key),
         }
+    }
+
+    /// A relay picked from a verified directory.
+    fn from_netdir(relay: &tor_netdir::Relay<'_>, dir: &VerifiedDirectory) -> Result<Self> {
+        let addr = relay
+            .addrs()
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| TorError::relay_selection("relay without an IPv4 address"))?;
+        let details = relay.low_level_details();
+        let mut relay_flags = HashSet::new();
+        if details.is_flagged_fast() {
+            relay_flags.insert(flags::FAST.to_string());
+        }
+        if details.is_flagged_stable() {
+            relay_flags.insert(flags::STABLE.to_string());
+        }
+        if details.is_suitable_as_guard() {
+            relay_flags.insert(flags::GUARD.to_string());
+        }
+        if details.policies_allow_some_port() {
+            relay_flags.insert(flags::EXIT.to_string());
+        }
+        let mut out = Relay::new(
+            hex::encode(relay.rsa_id().as_bytes()),
+            dir.nickname(relay.rsa_id()).to_string(),
+            addr.ip().to_string(),
+            addr.port(),
+            relay_flags,
+            hex::encode(relay.ntor_onion_key().as_bytes()),
+        );
+        out.ed25519_identity = Some(hex::encode(relay.id().as_bytes()));
+        Ok(out)
     }
 
     /// Convert to OwnedCircTarget for circuit creation
@@ -196,12 +234,82 @@ impl RelayCriteria {
 
 /// Relay manager for selecting appropriate relays
 pub struct RelayManager {
+    /// Relays given directly (tests); circuits use `directory`.
     pub relays: Vec<Relay>,
+    /// The verified Tor directory circuits pick their relays from.
+    directory: Option<Arc<VerifiedDirectory>>,
 }
 
 impl RelayManager {
     pub fn new(relays: Vec<Relay>) -> Self {
-        Self { relays }
+        Self {
+            relays,
+            directory: None,
+        }
+    }
+
+    /// Uses `directory` (verified, see `directory.rs`) for new circuits.
+    pub fn set_directory(&mut self, directory: Arc<VerifiedDirectory>) {
+        self.directory = Some(directory);
+    }
+
+    pub fn has_directory(&self) -> bool {
+        self.directory.is_some()
+    }
+
+    /// Number of relays circuits can use.
+    pub fn relay_count(&self) -> usize {
+        match &self.directory {
+            Some(dir) => dir.summary.usable_relays,
+            None => self.relays.len(),
+        }
+    }
+
+    /// Picks the middle and exit relays of a circuit whose first hop is
+    /// `first_hop`, from the verified directory, with Arti's relay selection:
+    /// bandwidth-weighted by role, the exit allowing port 443, no two relays
+    /// of the circuit in the same family or subnet. Signal's connections are
+    /// long-lived, so both relays need the Stable flag.
+    pub fn select_path<CT: ChanTarget>(&self, first_hop: &CT) -> Result<(Relay, Relay)> {
+        let dir = self.directory.as_ref().ok_or_else(|| {
+            TorError::relay_selection("no verified Tor directory to pick relays from")
+        })?;
+        let netdir = &dir.netdir;
+        let long_lived_ports: HashSet<u16> = [443].into_iter().collect();
+        let cfg = RelaySelectionConfig {
+            long_lived_ports: &long_lived_ports,
+            subnet_config: SubnetConfig::default(),
+        };
+        let mut rng = rand09::rng();
+
+        let first_hop_exclusion =
+            RelayExclusion::exclude_channel_target_family(&cfg, first_hop, netdir);
+        let exit_selector = RelaySelector::new(
+            RelayUsage::exit_to_all_ports(&cfg, vec![TargetPort::ipv4(443)]),
+            first_hop_exclusion.clone(),
+        );
+        let (exit, info) = exit_selector.select_relay(&mut rng, netdir);
+        let exit =
+            exit.ok_or_else(|| TorError::relay_selection(format!("no exit relay: {info}")))?;
+
+        let mut middle_exclusion = first_hop_exclusion;
+        middle_exclusion.extend(&RelayExclusion::exclude_relays_in_same_family(
+            &cfg,
+            vec![exit.clone()],
+            FamilyRules::from(netdir.params()),
+        ));
+        let middle_selector = RelaySelector::new(
+            RelayUsage::middle_relay(Some(exit_selector.usage())),
+            middle_exclusion,
+        );
+        let (middle, info) = middle_selector.select_relay(&mut rng, netdir);
+        let middle =
+            middle.ok_or_else(|| TorError::relay_selection(format!("no middle relay: {info}")))?;
+
+        Ok((
+            Relay::from_netdir(&middle, dir)?,
+            Relay::from_netdir(&exit, dir)?,
+        ))
     }
 
     /// Select relays matching the given criteria

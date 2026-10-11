@@ -989,6 +989,43 @@ pub fn get_version_info() -> JsValue {
     serde_wasm_bindgen::to_value(&info).unwrap_or(JsValue::NULL)
 }
 
+/// Verifies a Tor directory (consensus, authority certificates and
+/// microdescriptors, as served in the snapshot) at `now_ms` (milliseconds
+/// since 1970) with the same code the client runs before using one
+/// (webtor::directory). Returns a summary; throws the reason it was refused.
+#[wasm_bindgen(js_name = verifyTorDirectory)]
+pub fn verify_tor_directory(
+    consensus: &str,
+    certs: &str,
+    microdescs: &str,
+    now_ms: f64,
+) -> Result<JsValue, JsValue> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = UNIX_EPOCH + Duration::from_millis(now_ms.max(0.0) as u64);
+    let dir = webtor::directory::verify_directory(consensus, certs, microdescs, now)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let ms = |t: SystemTime| {
+        t.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0)
+    };
+    let s = &dir.summary;
+    let summary = serde_json::json!({
+        "relays": s.relays,
+        "usableRelays": s.usable_relays,
+        "certificates": s.certificates,
+        "microdescriptors": s.microdescriptors,
+        "droppedMicrodescriptors": s.dropped_microdescriptors,
+        "validAfter": ms(s.valid_after),
+        "freshUntil": ms(s.fresh_until),
+        "validUntil": ms(s.valid_until),
+    });
+    use serde::Serialize;
+    summary
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // Connections to Signal servers through Tor
 // ---------------------------------------------------------------------------
@@ -1033,9 +1070,14 @@ fn request_body_from_js(body: JsValue) -> Result<Option<RequestBody>, JsValue> {
         match next {
             Ok(piece) if piece.is_undefined() || piece.is_null() => None,
             Ok(piece) => match piece.dyn_into::<js_sys::Uint8Array>() {
-                Ok(bytes) => Some((Ok(webtor::signal_https::Bytes::from(bytes.to_vec())), Some(pull))),
+                Ok(bytes) => Some((
+                    Ok(webtor::signal_https::Bytes::from(bytes.to_vec())),
+                    Some(pull),
+                )),
                 Err(_) => Some((
-                    Err(TorError::http_request("request body: a piece is not a Uint8Array")),
+                    Err(TorError::http_request(
+                        "request body: a piece is not a Uint8Array",
+                    )),
                     None,
                 )),
             },
@@ -1045,7 +1087,10 @@ fn request_body_from_js(body: JsValue) -> Result<Option<RequestBody>, JsValue> {
                     .map(|e| String::from(e.message()))
                     .or_else(|| error.as_string())
                     .unwrap_or_else(|| "reading failed".to_string());
-                Some((Err(TorError::http_request(format!("request body: {}", message))), None))
+                Some((
+                    Err(TorError::http_request(format!("request body: {}", message))),
+                    None,
+                ))
             }
         }
     });

@@ -99,6 +99,9 @@ tor-async-utils = "0.37.0"
 tor-memquota = "0.37.0"
 tor-protover = "0.37.0"
 tor-units = "0.37.0"
+tor-dircommon = "0.37.0"
+tor-netdir = "0.37.0"
+tor-relay-selection = "0.37.0"
 
 # Cryptography
 rsa = "0.9"
@@ -159,6 +162,9 @@ tor-key-forge = { path = "vendor/arti/crates/tor-key-forge" }
 tor-keymgr = { path = "vendor/arti/crates/tor-keymgr" }
 tor-checkable = { path = "vendor/arti/crates/tor-checkable" }
 tor-netdoc = { path = "vendor/arti/crates/tor-netdoc" }
+tor-dircommon = { path = "vendor/arti/crates/tor-dircommon" }
+tor-netdir = { path = "vendor/arti/crates/tor-netdir" }
+tor-relay-selection = { path = "vendor/arti/crates/tor-relay-selection" }
 fslock-guard = { path = "vendor/arti/crates/fslock-guard" }
 fs-mistrust = { path = "vendor/arti/crates/fs-mistrust" }
 
