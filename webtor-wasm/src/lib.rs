@@ -1023,11 +1023,44 @@ fn set(target: &js_sys::Object, key: &str, value: &JsValue) {
     let _ = js_sys::Reflect::set(target, &JsValue::from_str(key), value);
 }
 
+type SocketSink = std::rc::Rc<AsyncMutex<Option<SplitSink<SignalWebSocket, Message>>>>;
+type SocketStream = std::rc::Rc<AsyncMutex<Option<SplitStream<SignalWebSocket>>>>;
+
 /// A binary WebSocket to a Signal server, tunnelled through Tor.
+///
+/// `abort()` ends it at once: pending operations fail, both halves are
+/// dropped (and with them the TLS and carrier streams), whatever state the
+/// connection is in. Use it when the connection is known to be dead (a
+/// hung Tor circuit never completes a closing handshake).
 #[wasm_bindgen]
 pub struct SignalSocket {
-    sink: std::rc::Rc<AsyncMutex<SplitSink<SignalWebSocket, Message>>>,
-    stream: std::rc::Rc<AsyncMutex<SplitStream<SignalWebSocket>>>,
+    sink: SocketSink,
+    stream: SocketStream,
+    aborted: std::rc::Rc<std::cell::Cell<bool>>,
+    pending: std::rc::Rc<RefCell<Vec<futures::future::AbortHandle>>>,
+}
+
+impl SignalSocket {
+    /// Runs `operation` unless the socket was aborted; `abort()` cancels it.
+    fn guarded<F>(&self, operation: F) -> js_sys::Promise
+    where
+        F: std::future::Future<Output = Result<JsValue, JsValue>> + 'static,
+    {
+        let aborted = self.aborted.clone();
+        let pending = self.pending.clone();
+        let (handle, registration) = futures::future::AbortHandle::new_pair();
+        future_to_promise(async move {
+            if aborted.get() {
+                return Err(JsValue::from_str("connection aborted"));
+            }
+            pending.borrow_mut().retain(|h| !h.is_aborted());
+            pending.borrow_mut().push(handle);
+            match futures::future::Abortable::new(operation, registration).await {
+                Ok(result) => result,
+                Err(_) => Err(JsValue::from_str("connection aborted")),
+            }
+        })
+    }
 }
 
 #[wasm_bindgen]
@@ -1091,8 +1124,10 @@ impl SignalSocket {
                 Upgrade::Open { socket, headers } => {
                     let (sink, stream) = socket.split();
                     let socket = SignalSocket {
-                        sink: std::rc::Rc::new(AsyncMutex::new(sink)),
-                        stream: std::rc::Rc::new(AsyncMutex::new(stream)),
+                        sink: std::rc::Rc::new(AsyncMutex::new(Some(sink))),
+                        stream: std::rc::Rc::new(AsyncMutex::new(Some(stream))),
+                        aborted: Default::default(),
+                        pending: Default::default(),
                     };
                     set(&result, "socket", &JsValue::from(socket));
                     set(&result, "status", &JsValue::from(101));
@@ -1110,9 +1145,11 @@ impl SignalSocket {
     /// Send one binary message.
     pub fn send(&self, data: Vec<u8>) -> js_sys::Promise {
         let sink = self.sink.clone();
-        future_to_promise(async move {
+        self.guarded(async move {
             sink.lock()
                 .await
+                .as_mut()
+                .ok_or_else(|| JsValue::from_str("connection aborted"))?
                 .send(Message::Binary(data))
                 .await
                 .map_err(|e| JsValue::from_str(&format!("send failed: {}", e)))?;
@@ -1123,9 +1160,11 @@ impl SignalSocket {
     /// Send a WebSocket ping; the pong shows up as activity in `recv`.
     pub fn ping(&self) -> js_sys::Promise {
         let sink = self.sink.clone();
-        future_to_promise(async move {
+        self.guarded(async move {
             sink.lock()
                 .await
+                .as_mut()
+                .ok_or_else(|| JsValue::from_str("connection aborted"))?
                 .send(Message::Ping(Vec::new()))
                 .await
                 .map_err(|e| JsValue::from_str(&format!("ping failed: {}", e)))?;
@@ -1136,11 +1175,15 @@ impl SignalSocket {
     /// Receive the next frame: a Uint8Array for a binary message, `true` for
     /// any other frame (pong, ping, text: not part of Signal's protocol, but
     /// proof that the server is alive), or `{ code, reason }` once the socket
-    /// is closed (code 1006 if it ended without a close frame).
+    /// is closed (code 1006 if it ended without a close frame). Rejects once
+    /// the socket was aborted.
     pub fn recv(&self) -> js_sys::Promise {
         let stream = self.stream.clone();
-        future_to_promise(async move {
+        self.guarded(async move {
             let mut stream = stream.lock().await;
+            let stream = stream
+                .as_mut()
+                .ok_or_else(|| JsValue::from_str("connection aborted"))?;
             let closed = |code: u16, reason: &str| {
                 let result = js_sys::Object::new();
                 set(&result, "code", &JsValue::from(code));
@@ -1160,20 +1203,40 @@ impl SignalSocket {
         })
     }
 
-    /// Close the socket with `code` and `reason`.
+    /// Close the socket with `code` and `reason` (a closing handshake; see
+    /// `abort` for a connection that may be dead).
     pub fn close(&self, code: u16, reason: String) -> js_sys::Promise {
         let sink = self.sink.clone();
-        future_to_promise(async move {
+        self.guarded(async move {
             use webtor::signal_socket::{CloseCode, CloseFrame};
             let frame = CloseFrame {
                 code: CloseCode::from(code),
                 reason: reason.into(),
             };
             let mut sink = sink.lock().await;
-            let _ = sink.send(Message::Close(Some(frame))).await;
-            let _ = sink.close().await;
+            if let Some(sink) = sink.as_mut() {
+                let _ = sink.send(Message::Close(Some(frame))).await;
+                let _ = sink.close().await;
+            }
             Ok(JsValue::UNDEFINED)
         })
+    }
+
+    /// End the connection now: pending and later operations fail, and the
+    /// connection (TLS, carrier stream) is dropped.
+    pub fn abort(&self) {
+        if self.aborted.replace(true) {
+            return;
+        }
+        for handle in self.pending.borrow_mut().drain(..) {
+            handle.abort();
+        }
+        let sink = self.sink.clone();
+        let stream = self.stream.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            drop(sink.lock().await.take());
+            drop(stream.lock().await.take());
+        });
     }
 }
 
@@ -1202,9 +1265,10 @@ impl SignalHttps {
         }
     }
 
-    /// Resolves to `{ status, headers, body }` (headers as [name, value]
-    /// pairs, body a Uint8Array). TLS trusts ONLY `root_pem`.
-    #[allow(clippy::too_many_arguments)]
+    /// Resolves to `{ status, headers, body }` once the response head
+    /// arrived (within `timeout_ms`, which covers connecting and sending):
+    /// headers as [name, value] pairs, `body` a SignalHttpsBody to read the
+    /// body from. TLS trusts ONLY `root_pem`.
     pub fn request(
         &self,
         method: String,
@@ -1213,7 +1277,6 @@ impl SignalHttps {
         body: Option<Vec<u8>>,
         root_pem: String,
         timeout_ms: u32,
-        max_response_bytes: u32,
     ) -> js_sys::Promise {
         let inner = self.inner.clone();
         let headers = header_list_from_js(headers);
@@ -1226,17 +1289,20 @@ impl SignalHttps {
                     body,
                     root_pem,
                     timeout: Duration::from_millis(timeout_ms.into()),
-                    max_response_bytes: max_response_bytes as usize,
                 })
                 .await
                 .map_err(tor_error_to_js)?;
             let result = js_sys::Object::new();
             set(&result, "status", &JsValue::from(response.status));
             set(&result, "headers", &header_list_to_js(&response.headers));
+            let abort = response.body.abort_handle();
             set(
                 &result,
                 "body",
-                &js_sys::Uint8Array::from(&response.body[..]).into(),
+                &JsValue::from(SignalHttpsBody {
+                    body: std::rc::Rc::new(AsyncMutex::new(response.body)),
+                    abort,
+                }),
             );
             Ok(result.into())
         })
@@ -1245,5 +1311,39 @@ impl SignalHttps {
     /// Drop all idle connections.
     pub fn clear(&self) {
         self.inner.clear();
+    }
+}
+
+/// The body of a SignalHttps response, received piece by piece.
+#[wasm_bindgen]
+pub struct SignalHttpsBody {
+    body: std::rc::Rc<AsyncMutex<webtor::signal_https::HttpsBody>>,
+    abort: futures::future::AbortHandle,
+}
+
+#[wasm_bindgen]
+impl SignalHttpsBody {
+    /// Resolves to the next piece (a Uint8Array), or `undefined` at the end
+    /// of the body. Rejects if nothing arrives within `idle_timeout_ms`, if
+    /// the connection fails or the body is cut short, or after `cancel()`.
+    pub fn next(&self, idle_timeout_ms: u32) -> js_sys::Promise {
+        let body = self.body.clone();
+        future_to_promise(async move {
+            let piece = body
+                .lock()
+                .await
+                .next(Duration::from_millis(idle_timeout_ms.into()))
+                .await
+                .map_err(tor_error_to_js)?;
+            Ok(match piece {
+                Some(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
+                None => JsValue::UNDEFINED,
+            })
+        })
+    }
+
+    /// Stop receiving: the connection is aborted, a pending `next` fails.
+    pub fn cancel(&self) {
+        self.abort.abort();
     }
 }
