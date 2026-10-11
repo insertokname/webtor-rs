@@ -996,7 +996,7 @@ pub fn get_version_info() -> JsValue {
 use futures::lock::Mutex as AsyncMutex;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use webtor::signal_https::{HttpsRequest, SignalHttpsClient};
+use webtor::signal_https::{HttpsRequest, RequestBody, SignalHttpsClient};
 use webtor::signal_socket::{Carrier, HeaderList, Message, SignalWebSocket, Upgrade};
 
 fn tor_carrier(client: &TorClient) -> Result<Carrier, JsValue> {
@@ -1005,6 +1005,51 @@ fn tor_carrier(client: &TorClient) -> Result<Carrier, JsValue> {
         .clone()
         .map(Carrier::Tor)
         .ok_or_else(|| JsTorError::not_initialized().into_js_value())
+}
+
+/// A request body from JS: `undefined`/`null` (none), a Uint8Array, or a
+/// function returning a Promise of the next piece (a Uint8Array), or of
+/// `undefined` at the end; it is called whenever the connection takes more.
+fn request_body_from_js(body: JsValue) -> Result<Option<RequestBody>, JsValue> {
+    use wasm_bindgen::JsCast;
+    if body.is_undefined() || body.is_null() {
+        return Ok(None);
+    }
+    if let Some(bytes) = body.dyn_ref::<js_sys::Uint8Array>() {
+        return Ok(Some(RequestBody::Bytes(bytes.to_vec())));
+    }
+    let Some(pull) = body.dyn_ref::<js_sys::Function>().cloned() else {
+        return Err(JsValue::from_str(
+            "request body must be a Uint8Array, a function or undefined",
+        ));
+    };
+    let stream = futures::stream::unfold(Some(pull), |state| async move {
+        let pull = state?;
+        let next = async {
+            let promise: js_sys::Promise = pull.call0(&JsValue::UNDEFINED)?.dyn_into()?;
+            wasm_bindgen_futures::JsFuture::from(promise).await
+        }
+        .await;
+        match next {
+            Ok(piece) if piece.is_undefined() || piece.is_null() => None,
+            Ok(piece) => match piece.dyn_into::<js_sys::Uint8Array>() {
+                Ok(bytes) => Some((Ok(webtor::signal_https::Bytes::from(bytes.to_vec())), Some(pull))),
+                Err(_) => Some((
+                    Err(TorError::http_request("request body: a piece is not a Uint8Array")),
+                    None,
+                )),
+            },
+            Err(error) => {
+                let message = error
+                    .dyn_ref::<js_sys::Error>()
+                    .map(|e| String::from(e.message()))
+                    .or_else(|| error.as_string())
+                    .unwrap_or_else(|| "reading failed".to_string());
+                Some((Err(TorError::http_request(format!("request body: {}", message))), None))
+            }
+        }
+    });
+    Ok(Some(RequestBody::Stream(stream.boxed_local())))
 }
 
 fn header_list_from_js(headers: JsValue) -> Result<HeaderList, JsValue> {
@@ -1268,25 +1313,29 @@ impl SignalHttps {
     /// Resolves to `{ status, headers, body }` once the response head
     /// arrived (within `timeout_ms`, which covers connecting and sending):
     /// headers as [name, value] pairs, `body` a SignalHttpsBody to read the
-    /// body from. TLS trusts ONLY `root_pem`.
+    /// body from. TLS trusts ONLY `root_pem`. The request `body` is
+    /// `undefined`, a Uint8Array, or a function that streams it (see
+    /// request_body_from_js); with a streamed body, `timeout_ms` bounds each
+    /// wait (connecting, the next piece being taken, the response head).
     pub fn request(
         &self,
         method: String,
         url: String,
         headers: JsValue,
-        body: Option<Vec<u8>>,
+        body: JsValue,
         root_pem: String,
         timeout_ms: u32,
     ) -> js_sys::Promise {
         let inner = self.inner.clone();
         let headers = header_list_from_js(headers);
+        let body = request_body_from_js(body);
         future_to_promise(async move {
             let response = inner
                 .request(HttpsRequest {
                     method,
                     url,
                     headers: headers?,
-                    body,
+                    body: body?,
                     root_pem,
                     timeout: Duration::from_millis(timeout_ms.into()),
                 })

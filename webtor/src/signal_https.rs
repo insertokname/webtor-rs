@@ -7,7 +7,11 @@
 //!
 //! Response bodies are streamed: [`HttpsBody::next`] yields the body piece by
 //! piece as it arrives, each piece within an idle timeout, so large downloads
-//! neither sit in memory nor need a deadline for the whole transfer. A
+//! neither sit in memory nor need a deadline for the whole transfer. Request
+//! bodies can be streamed too ([`RequestBody::Stream`], e.g. uploads): pieces
+//! are pulled as the connection takes them, and the request's timeout then
+//! bounds each wait (connecting, the next piece being taken, the response
+//! head after the last piece) instead of the whole upload. A
 //! connection whose request or body is abandoned (error, timeout, cancel,
 //! drop) is aborted: its task ends and the TLS and carrier streams are
 //! dropped, so a hung connection never lingers.
@@ -15,10 +19,15 @@
 use crate::error::{Result, TorError};
 use crate::signal_socket::{connect_tls, pinned_tls_config, Carrier, HeaderList};
 use crate::time::Instant;
-use bytes::Bytes;
+pub use bytes::Bytes;
 use futures::future::{AbortHandle, Abortable};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use futures::stream::LocalBoxStream;
+use futures::StreamExt;
+use http_body_util::BodyExt;
+use hyper::body::{Frame, Incoming, SizeHint};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::cell::Cell;
 use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
 use std::cell::RefCell;
@@ -32,16 +41,64 @@ use tracing::{debug, warn};
 const IDLE_TIMEOUT: Duration = Duration::from_secs(50);
 const MAX_IDLE_PER_KEY: usize = 4;
 
+/// A request body: none, in memory, or pulled piece by piece.
+pub enum RequestBody {
+    Bytes(Vec<u8>),
+    Stream(LocalBoxStream<'static, Result<Bytes>>),
+}
+
 pub struct HttpsRequest {
     pub method: String,
     /// Absolute https:// URL.
     pub url: String,
     pub headers: HeaderList,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<RequestBody>,
     pub root_pem: String,
     /// Covers connecting, sending the request and receiving the response
-    /// head; the body has its own idle timeout (see [`HttpsBody::next`]).
+    /// head; with a streamed body, each of those waits instead (see the
+    /// module documentation). The response body has its own idle timeout
+    /// (see [`HttpsBody::next`]).
     pub timeout: Duration,
+}
+
+/// What hyper sends: a body in memory, or pieces pulled from a stream (not
+/// `Send`: on wasm the pieces come from JavaScript).
+enum OutgoingBody {
+    Full(Option<Bytes>),
+    Stream(LocalBoxStream<'static, Result<Bytes>>),
+}
+
+impl hyper::body::Body for OutgoingBody {
+    type Data = Bytes;
+    type Error = TorError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>>>> {
+        match self.get_mut() {
+            OutgoingBody::Full(bytes) => {
+                Poll::Ready(bytes.take().filter(|b| !b.is_empty()).map(|b| Ok(Frame::data(b))))
+            }
+            OutgoingBody::Stream(stream) => stream
+                .poll_next_unpin(cx)
+                .map(|piece| piece.map(|piece| piece.map(Frame::data))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            OutgoingBody::Full(bytes) => bytes.as_ref().is_none_or(|b| b.is_empty()),
+            OutgoingBody::Stream(_) => false,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            OutgoingBody::Full(bytes) => SizeHint::with_exact(bytes.as_ref().map_or(0, |b| b.len() as u64)),
+            OutgoingBody::Stream(_) => SizeHint::default(),
+        }
+    }
 }
 
 pub struct HttpsResponse {
@@ -59,7 +116,7 @@ struct PoolKey {
 
 /// One HTTP/1.1 connection: the request handle and the means to end its task.
 struct Connection {
-    sender: SendRequest<Full<Bytes>>,
+    sender: SendRequest<OutgoingBody>,
     abort: AbortHandle,
 }
 
@@ -215,6 +272,36 @@ impl Drop for HttpsBody {
     }
 }
 
+/// Runs `future` until it completes, failing if `progress` (a time the
+/// future keeps moving forward) falls `timeout` behind.
+async fn with_idle_timeout<F, T>(
+    timeout: Duration,
+    operation_name: &str,
+    progress: &Cell<Instant>,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    use futures::future::{select, Either};
+
+    let mut future = std::pin::pin!(future);
+    loop {
+        let idle = progress.get().elapsed();
+        if idle >= timeout {
+            return Err(TorError::timeout(format!(
+                "{} made no progress for {:?}",
+                operation_name, timeout
+            )));
+        }
+        let sleep = std::pin::pin!(crate::retry::sleep(timeout - idle));
+        match select(future.as_mut(), sleep).await {
+            Either::Left((result, _)) => return result,
+            Either::Right(((), _)) => continue,
+        }
+    }
+}
+
 /// An HTTPS client over one carrier. Create a new one when the carrier is
 /// replaced (e.g. a new Tor client), so that no connection outlives it.
 pub struct SignalHttpsClient {
@@ -260,12 +347,21 @@ impl SignalHttpsClient {
         let timeout = request.timeout;
         // The connection in use, so that a timeout can abort it.
         let current: RefCell<Option<AbortHandle>> = RefCell::new(None);
-        let result = crate::retry::with_timeout(
-            timeout,
-            "HTTPS request",
-            self.request_inner(request, &current),
-        )
-        .await;
+        let streamed = matches!(request.body, Some(RequestBody::Stream(_)));
+        let result = if streamed {
+            // Progress: set when the request starts and whenever the
+            // connection takes a piece of the body (or its end).
+            let progress = Rc::new(Cell::new(Instant::now()));
+            let inner = self.request_inner(request, &current, Some(progress.clone()));
+            with_idle_timeout(timeout, "HTTPS request", &progress, inner).await
+        } else {
+            crate::retry::with_timeout(
+                timeout,
+                "HTTPS request",
+                self.request_inner(request, &current, None),
+            )
+            .await
+        };
         if result.is_err() {
             if let Some(abort) = current.borrow_mut().take() {
                 abort.abort();
@@ -278,6 +374,7 @@ impl SignalHttpsClient {
         &self,
         request: HttpsRequest,
         current: &RefCell<Option<AbortHandle>>,
+        progress: Option<Rc<Cell<Instant>>>,
     ) -> Result<HttpsResponse> {
         let url = url::Url::parse(&request.url)
             .map_err(|e| TorError::http_request(format!("invalid URL: {}", e)))?;
@@ -305,9 +402,38 @@ impl SignalHttpsClient {
         } else {
             format!("{}:{}", host, port)
         };
-        let body = Bytes::from(request.body.unwrap_or_default());
+        // In memory: can be sent again (a retry on a fresh connection).
+        // Streamed: sent once, on a fresh connection (no retry).
+        let (bytes, mut stream) = match request.body {
+            None => (Bytes::new(), None),
+            Some(RequestBody::Bytes(bytes)) => (Bytes::from(bytes), None),
+            Some(RequestBody::Stream(stream)) => (Bytes::new(), Some(stream)),
+        };
+        let streamed = stream.is_some();
 
-        let build = || -> Result<hyper::Request<Full<Bytes>>> {
+        let mut build = || -> Result<hyper::Request<OutgoingBody>> {
+            let body: OutgoingBody = match stream.take() {
+                Some(stream) => {
+                    // Every piece taken, and the end, is progress.
+                    let progress = progress.clone();
+                    let pieces = stream
+                        .map(Some)
+                        .chain(futures::stream::once(async { None }))
+                        .filter_map(move |piece| {
+                            if let Some(progress) = &progress {
+                                progress.set(Instant::now());
+                            }
+                            async move { piece }
+                        });
+                    OutgoingBody::Stream(pieces.boxed_local())
+                }
+                None if streamed => {
+                    return Err(TorError::http_request(
+                        "a streamed request body can only be sent once",
+                    ))
+                }
+                None => OutgoingBody::Full(Some(bytes.clone())),
+            };
             let mut builder = hyper::Request::builder()
                 .method(method.clone())
                 .uri(path_and_query.as_str());
@@ -322,7 +448,7 @@ impl SignalHttpsClient {
                 builder = builder.header(name.as_str(), value.as_str());
             }
             builder
-                .body(Full::new(body.clone()))
+                .body(body)
                 .map_err(|e| TorError::http_request(format!("invalid request: {}", e)))
         };
 
@@ -330,7 +456,11 @@ impl SignalHttpsClient {
         // just before we sent on it; then retry once on a fresh connection,
         // if the request was never sent or is safe to repeat.
         let idempotent = matches!(method, hyper::Method::GET | hyper::Method::HEAD);
-        let mut reused = self.pool.borrow_mut().take(&key);
+        let mut reused = if streamed {
+            None
+        } else {
+            self.pool.borrow_mut().take(&key)
+        };
         loop {
             let was_reused = reused.is_some();
             let mut connection = match reused.take() {
