@@ -16,7 +16,7 @@ mod wasm {
     use std::rc::Rc;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
-    use web_sys::{BinaryType, ErrorEvent, MessageEvent, WebSocket};
+    use web_sys::{BinaryType, MessageEvent, WebSocket};
 
     /// WebSocket stream wrapper implementing AsyncRead and AsyncWrite
     #[allow(dead_code)] // Fields are held to keep callbacks alive
@@ -25,7 +25,7 @@ mod wasm {
         rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
         buffer: Vec<u8>,
         _on_message: Closure<dyn FnMut(MessageEvent)>,
-        _on_error: Closure<dyn FnMut(ErrorEvent)>,
+        _on_error: Closure<dyn FnMut(web_sys::Event)>,
         _on_close: Closure<dyn FnMut(web_sys::CloseEvent)>,
     }
 
@@ -64,14 +64,16 @@ mod wasm {
 
             // onerror
             let open_tx_err = open_tx.clone();
-            let on_error = Closure::wrap(Box::new(move |e: ErrorEvent| {
-                let msg = e.message();
+            // A WebSocket's error event is a plain Event (no message): reading
+            // ErrorEvent.message from it would throw in the JS glue.
+            let on_error = Closure::wrap(Box::new(move |_e: web_sys::Event| {
+                let msg = String::from("WebSocket error");
                 // If we are still connecting, fail the connection future
                 if let Some(tx) = open_tx_err.borrow_mut().take() {
                     let _ = tx.send(Err(format!("WebSocket error during connection: {}", msg)));
                 }
                 let _ = tx_err.unbounded_send(Err(io::Error::other(msg)));
-            }) as Box<dyn FnMut(ErrorEvent)>);
+            }) as Box<dyn FnMut(web_sys::Event)>);
             socket.set_onerror(Some(on_error.as_ref().unchecked_ref()));
 
             // onclose
@@ -105,6 +107,11 @@ mod wasm {
             });
             socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
 
+            // Until the stream owns the handlers: if connecting fails or this
+            // future is dropped (a timeout), the closures are dropped here,
+            // so the socket must not call them any more.
+            let mut guard = PendingSocket(Some(socket.clone()));
+
             // Wait for connection or error
             match open_rx.await {
                 Ok(Ok(())) => {}
@@ -119,6 +126,7 @@ mod wasm {
             // Clear onopen handler before it's dropped to prevent
             // "closure invoked after being dropped" errors
             socket.set_onopen(None);
+            guard.0 = None;
 
             Ok(Self {
                 socket,
@@ -128,6 +136,20 @@ mod wasm {
                 _on_error: on_error,
                 _on_close: on_close,
             })
+        }
+    }
+
+    struct PendingSocket(Option<WebSocket>);
+
+    impl Drop for PendingSocket {
+        fn drop(&mut self) {
+            if let Some(socket) = self.0.take() {
+                socket.set_onmessage(None);
+                socket.set_onerror(None);
+                socket.set_onclose(None);
+                socket.set_onopen(None);
+                let _ = socket.close();
+            }
         }
     }
 
