@@ -61,7 +61,9 @@ impl TorClient {
         // Load cached consensus to populate relay manager
         // This is essential for WASM where we need relays before we can fetch fresh consensus
         info!("Loading cached consensus...");
-        if let Err(e) = directory_manager.load_cached_consensus().await {
+        if let Err(e) = directory_manager
+            .load_cached_consensus(options.directory_url.as_deref())
+            .await {
             error!("Failed to load cached consensus: {}", e);
             return Err(e);
         }
@@ -89,9 +91,12 @@ impl TorClient {
 
             // Establish the channel
             info!("TorClient::new: calling establish_channel");
+            // Fail loudly: callers get the real reason instead of a later
+            // "Channel not established" from wait_for_circuit.
             if let Err(e) = client.establish_channel().await {
                 error!("Failed to establish channel: {}", e);
-                // Don't fail the client creation, just log the error
+                client.close().await;
+                return Err(e);
             }
             info!("TorClient::new: establish_channel returned");
         }

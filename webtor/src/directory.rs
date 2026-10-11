@@ -34,11 +34,14 @@ impl DirectoryManager {
     /// Load relays from cached consensus data fetched from static URL.
     /// This is used for WASM builds where we can't fetch consensus before establishing a circuit.
     #[cfg(target_arch = "wasm32")]
-    pub async fn load_cached_consensus(&self) -> Result<()> {
+    pub async fn load_cached_consensus(&self, base_url: Option<&str>) -> Result<()> {
         info!("Fetching cached consensus from static URL...");
+        let base_url = base_url
+            .unwrap_or(CACHED_CONSENSUS_BASE_URL)
+            .trim_end_matches('/');
 
         // Fetch brotli-compressed consensus
-        let consensus_url = format!("{}/consensus.txt.br", CACHED_CONSENSUS_BASE_URL);
+        let consensus_url = format!("{}/consensus.txt.br", base_url);
         let consensus_bytes = fetch_url(&consensus_url)
             .await
             .map_err(|e| TorError::Internal(format!("Failed to fetch cached consensus: {}", e)))?;
@@ -52,7 +55,7 @@ impl DirectoryManager {
         info!("Decompressed consensus: {} bytes", consensus_body.len());
 
         // Fetch brotli-compressed microdescriptors
-        let microdescs_url = format!("{}/microdescriptors.txt.br", CACHED_CONSENSUS_BASE_URL);
+        let microdescs_url = format!("{}/microdescriptors.txt.br", base_url);
         let microdescs_bytes = fetch_url(&microdescs_url).await.map_err(|e| {
             TorError::Internal(format!("Failed to fetch cached microdescriptors: {}", e))
         })?;
@@ -76,7 +79,7 @@ impl DirectoryManager {
 
     /// Load relays from cached consensus - native version (not implemented, use fetch_and_process_consensus)
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn load_cached_consensus(&self) -> Result<()> {
+    pub async fn load_cached_consensus(&self, _base_url: Option<&str>) -> Result<()> {
         // For native builds, we don't pre-load cached consensus
         // The circuit will be created after fetching fresh consensus via the Tor network
         info!("Native build: skipping cached consensus (will fetch fresh via Tor)");

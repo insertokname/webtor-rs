@@ -205,6 +205,13 @@ impl TorClientOptions {
         self
     }
 
+    /// Base URL of the cached Tor directory (default `./tor`)
+    #[wasm_bindgen(js_name = withDirectoryUrl)]
+    pub fn with_directory_url(mut self, url: String) -> Self {
+        self.inner = self.inner.with_directory_url(url);
+        self
+    }
+
     #[wasm_bindgen(js_name = withBridgeFingerprint)]
     pub fn with_bridge_fingerprint(mut self, fingerprint: String) -> Self {
         self.inner = self.inner.with_bridge_fingerprint(fingerprint);

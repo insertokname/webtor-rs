@@ -91,6 +91,11 @@ pub struct TorClientOptions {
     #[serde(default)]
     pub stream_isolation: StreamIsolationPolicy,
 
+    /// Base URL of the cached Tor directory (`consensus.txt.br`,
+    /// `microdescriptors.txt.br`); `None` means `./tor` relative to the page
+    #[serde(default)]
+    pub directory_url: Option<String>,
+
     /// Optional logging callback function (for WASM bindings)
     #[serde(skip)]
     pub on_log: Option<LogCallback>,
@@ -125,6 +130,7 @@ impl Default for TorClientOptions {
             circuit_update_advance: default_circuit_update_advance(),
             bridge_fingerprint: None,
             stream_isolation: StreamIsolationPolicy::default(),
+            directory_url: None,
             on_log: None,
         }
     }
@@ -260,6 +266,11 @@ impl TorClientOptions {
 
     pub fn with_stream_isolation(mut self, policy: StreamIsolationPolicy) -> Self {
         self.stream_isolation = policy;
+        self
+    }
+
+    pub fn with_directory_url(mut self, url: String) -> Self {
+        self.directory_url = Some(url);
         self
     }
 
