@@ -34,6 +34,9 @@ pub mod webrtc_stream;
 pub mod signal_socket;
 
 #[cfg(target_arch = "wasm32")]
+pub mod signal_https;
+
+#[cfg(target_arch = "wasm32")]
 pub use subtle_tls;
 
 pub use client::TorClient;

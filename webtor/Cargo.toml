@@ -77,6 +77,12 @@ futures-rustls = { workspace = true }
 rustls-pki-types = { version = "1.13", features = ["web"] }
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 async-tungstenite = { version = "0.28", default-features = false, features = ["handshake", "futures-03-sink"] }
+# HTTP/1.1 client for Signal's HTTPS hosts (storage service, CDNs), over the same rustls streams
+hyper = { version = "1.10", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.3"
+bytes = "1"
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Native TLS (non-WASM only) - ring doesn't compile to WASM

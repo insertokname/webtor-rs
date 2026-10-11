@@ -63,7 +63,8 @@ impl TorClient {
         info!("Loading cached consensus...");
         if let Err(e) = directory_manager
             .load_cached_consensus(options.directory_url.as_deref())
-            .await {
+            .await
+        {
             error!("Failed to load cached consensus: {}", e);
             return Err(e);
         }
@@ -375,29 +376,18 @@ impl TorClient {
         info!("Tor client closed");
     }
 
-    /// Open a TCP stream through Tor to `host:port` and run
-    /// rustls over it with the given client config (caller controls trust roots).
-    #[cfg(target_arch = "wasm32")]
-    pub async fn open_tls(
+    /// Open a Tor stream to `host:port` (resolved by the exit relay).
+    pub async fn open_stream(
         &self,
         host: &str,
         port: u16,
-        config: std::sync::Arc<rustls::ClientConfig>,
-    ) -> Result<futures_rustls::client::TlsStream<tor_proto::client::stream::DataStream>> {
+    ) -> Result<tor_proto::client::stream::DataStream> {
         let circuit = {
             let circuit_manager = self.circuit_manager.read().await;
             circuit_manager.get_circuit_for_isolation_key(None).await?
         };
-        let stream = {
-            let circuit_read = circuit.read().await;
-            circuit_read.begin_stream(host, port).await?
-        };
-        let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
-            .map_err(|e| TorError::tls(format!("invalid server name {}: {}", host, e)))?;
-        futures_rustls::TlsConnector::from(config)
-            .connect(server_name, stream)
-            .await
-            .map_err(|e| TorError::tls(format!("TLS with {} failed: {}", host, e)))
+        let circuit_read = circuit.read().await;
+        circuit_read.begin_stream(host, port).await
     }
 
     /// Abort all in-flight operations.

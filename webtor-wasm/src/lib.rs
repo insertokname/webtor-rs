@@ -990,13 +990,38 @@ pub fn get_version_info() -> JsValue {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket to a Signal server through Tor
+// Connections to Signal servers through Tor
 // ---------------------------------------------------------------------------
 
 use futures::lock::Mutex as AsyncMutex;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use webtor::signal_socket::{Message, SignalWebSocket};
+use webtor::signal_https::{HttpsRequest, SignalHttpsClient};
+use webtor::signal_socket::{Carrier, HeaderList, Message, SignalWebSocket, Upgrade};
+
+fn tor_carrier(client: &TorClient) -> Result<Carrier, JsValue> {
+    client
+        .inner
+        .clone()
+        .map(Carrier::Tor)
+        .ok_or_else(|| JsTorError::not_initialized().into_js_value())
+}
+
+fn header_list_from_js(headers: JsValue) -> Result<HeaderList, JsValue> {
+    if headers.is_undefined() || headers.is_null() {
+        return Ok(Vec::new());
+    }
+    serde_wasm_bindgen::from_value(headers)
+        .map_err(|e| JsValue::from_str(&format!("headers must be [name, value] pairs: {}", e)))
+}
+
+fn header_list_to_js(headers: &HeaderList) -> JsValue {
+    serde_wasm_bindgen::to_value(headers).unwrap_or_else(|_| js_sys::Array::new().into())
+}
+
+fn set(target: &js_sys::Object, key: &str, value: &JsValue) {
+    let _ = js_sys::Reflect::set(target, &JsValue::from_str(key), value);
+}
 
 /// A binary WebSocket to a Signal server, tunnelled through Tor.
 #[wasm_bindgen]
@@ -1007,29 +1032,49 @@ pub struct SignalSocket {
 
 #[wasm_bindgen]
 impl SignalSocket {
-    /// Open `url` (wss://...) through `client`, trusting ONLY `root_pem`.
-    /// Resolves to a SignalSocket, or to a number (the HTTP status) when the
-    /// server refuses the upgrade.
+    /// Open `url` (wss://...) through `client`, trusting ONLY `root_pem`, with
+    /// `headers` ([name, value] pairs) on the upgrade request. Resolves to
+    /// `{ socket, status: 101, headers }`, or to `{ status, headers }` when the
+    /// server refuses the upgrade. Rejects if no handshake within `timeout_ms`.
     pub fn open(
         client: &TorClient,
         url: String,
         root_pem: String,
-        authorization: Option<String>,
+        headers: JsValue,
+        timeout_ms: u32,
     ) -> js_sys::Promise {
-        let client = client.inner.clone();
+        let carrier = tor_carrier(client);
+        let headers = header_list_from_js(headers);
         future_to_promise(async move {
-            let client = client.ok_or_else(|| JsTorError::not_initialized().into_js_value())?;
-            match webtor::signal_socket::open(&client, &url, &root_pem, authorization.as_deref()).await {
-                Ok(Ok(ws)) => {
-                    let (sink, stream) = ws.split();
-                    Ok(JsValue::from(SignalSocket {
+            let carrier = carrier?;
+            let headers = headers?;
+            let upgrade = webtor::signal_socket::open(
+                &carrier,
+                &url,
+                &root_pem,
+                &headers,
+                Duration::from_millis(timeout_ms.into()),
+            )
+            .await
+            .map_err(tor_error_to_js)?;
+            let result = js_sys::Object::new();
+            match upgrade {
+                Upgrade::Open { socket, headers } => {
+                    let (sink, stream) = socket.split();
+                    let socket = SignalSocket {
                         sink: std::rc::Rc::new(AsyncMutex::new(sink)),
                         stream: std::rc::Rc::new(AsyncMutex::new(stream)),
-                    }))
+                    };
+                    set(&result, "socket", &JsValue::from(socket));
+                    set(&result, "status", &JsValue::from(101));
+                    set(&result, "headers", &header_list_to_js(&headers));
                 }
-                Ok(Err(status)) => Ok(JsValue::from(status)),
-                Err(e) => Err(tor_error_to_js(e)),
+                Upgrade::Refused { status, headers } => {
+                    set(&result, "status", &JsValue::from(status));
+                    set(&result, "headers", &header_list_to_js(&headers));
+                }
             }
+            Ok(result.into())
         })
     }
 
@@ -1046,30 +1091,121 @@ impl SignalSocket {
         })
     }
 
-    /// Receive the next binary message; resolves to null when the socket closes.
+    /// Send a WebSocket ping; the pong shows up as activity in `recv`.
+    pub fn ping(&self) -> js_sys::Promise {
+        let sink = self.sink.clone();
+        future_to_promise(async move {
+            sink.lock()
+                .await
+                .send(Message::Ping(Vec::new()))
+                .await
+                .map_err(|e| JsValue::from_str(&format!("ping failed: {}", e)))?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    /// Receive the next frame: a Uint8Array for a binary message, `true` for
+    /// any other frame (pong, ping, text: not part of Signal's protocol, but
+    /// proof that the server is alive), or `{ code, reason }` once the socket
+    /// is closed (code 1006 if it ended without a close frame).
     pub fn recv(&self) -> js_sys::Promise {
         let stream = self.stream.clone();
         future_to_promise(async move {
             let mut stream = stream.lock().await;
-            loop {
-                match stream.next().await {
-                    Some(Ok(Message::Binary(data))) => {
-                        return Ok(js_sys::Uint8Array::from(&data[..]).into())
-                    }
-                    Some(Ok(Message::Close(_))) | None => return Ok(JsValue::NULL),
-                    Some(Ok(_)) => continue, // ping/pong/text: not part of Signal's protocol
-                    Some(Err(e)) => return Err(JsValue::from_str(&format!("recv failed: {}", e))),
-                }
+            let closed = |code: u16, reason: &str| {
+                let result = js_sys::Object::new();
+                set(&result, "code", &JsValue::from(code));
+                set(&result, "reason", &JsValue::from_str(reason));
+                JsValue::from(result)
+            };
+            match stream.next().await {
+                Some(Ok(Message::Binary(data))) => Ok(js_sys::Uint8Array::from(&data[..]).into()),
+                Some(Ok(Message::Close(frame))) => Ok(match frame {
+                    Some(frame) => closed(frame.code.into(), &frame.reason),
+                    None => closed(1005, ""),
+                }),
+                Some(Ok(_)) => Ok(JsValue::TRUE),
+                None => Ok(closed(1006, "")),
+                Some(Err(e)) => Err(JsValue::from_str(&format!("recv failed: {}", e))),
             }
         })
     }
 
-    /// Close the socket.
-    pub fn close(&self) -> js_sys::Promise {
+    /// Close the socket with `code` and `reason`.
+    pub fn close(&self, code: u16, reason: String) -> js_sys::Promise {
         let sink = self.sink.clone();
         future_to_promise(async move {
-            let _ = sink.lock().await.close().await;
+            use webtor::signal_socket::{CloseCode, CloseFrame};
+            let frame = CloseFrame {
+                code: CloseCode::from(code),
+                reason: reason.into(),
+            };
+            let mut sink = sink.lock().await;
+            let _ = sink.send(Message::Close(Some(frame))).await;
+            let _ = sink.close().await;
             Ok(JsValue::UNDEFINED)
         })
+    }
+}
+
+/// HTTPS requests to Signal hosts through Tor (hyper HTTP/1.1 over rustls),
+/// with keep-alive connections reused per host. One per Tor client.
+#[wasm_bindgen]
+pub struct SignalHttps {
+    inner: std::rc::Rc<SignalHttpsClient>,
+}
+
+#[wasm_bindgen]
+impl SignalHttps {
+    #[wasm_bindgen(constructor)]
+    pub fn new(client: &TorClient) -> Result<SignalHttps, JsValue> {
+        Ok(SignalHttps {
+            inner: std::rc::Rc::new(SignalHttpsClient::new(tor_carrier(client)?)),
+        })
+    }
+
+    /// Resolves to `{ status, headers, body }` (headers as [name, value]
+    /// pairs, body a Uint8Array). TLS trusts ONLY `root_pem`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request(
+        &self,
+        method: String,
+        url: String,
+        headers: JsValue,
+        body: Option<Vec<u8>>,
+        root_pem: String,
+        timeout_ms: u32,
+        max_response_bytes: u32,
+    ) -> js_sys::Promise {
+        let inner = self.inner.clone();
+        let headers = header_list_from_js(headers);
+        future_to_promise(async move {
+            let response = inner
+                .request(HttpsRequest {
+                    method,
+                    url,
+                    headers: headers?,
+                    body,
+                    root_pem,
+                    timeout: Duration::from_millis(timeout_ms.into()),
+                    max_response_bytes: max_response_bytes as usize,
+                })
+                .await
+                .map_err(tor_error_to_js)?;
+            let result = js_sys::Object::new();
+            set(&result, "status", &JsValue::from(response.status));
+            set(&result, "headers", &header_list_to_js(&response.headers));
+            set(
+                &result,
+                "body",
+                &js_sys::Uint8Array::from(&response.body[..]).into(),
+            );
+            Ok(result.into())
+        })
+    }
+
+    /// Drop all idle connections.
+    pub fn clear(&self) {
+        self.inner.clear();
     }
 }
