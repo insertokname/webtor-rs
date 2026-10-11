@@ -88,8 +88,10 @@ pub struct KcpStream<S> {
     start_time: Instant,
     /// Fires when KCP next needs `update` (retransmissions, window probes, flushes)
     timer: Option<Timer>,
-    /// Task waiting for send-window space
-    write_waker: Option<Waker>,
+    /// Tasks waiting for send-window space. Both the reader (control frames
+    /// such as SMUX window updates) and the writer can wait here, so a single
+    /// slot could lose the writer's wakeup.
+    write_wakers: Vec<Waker>,
     /// Maximum bytes waiting in KCP's send queue before applying backpressure
     snd_limit: usize,
     /// Scratch buffer for transport reads
@@ -118,7 +120,7 @@ impl<S> KcpStream<S> {
             transport,
             start_time: Instant::now(),
             timer: None,
-            write_waker: None,
+            write_wakers: Vec::new(),
             snd_limit: 2 * config.snd_wnd as usize,
             rx_scratch: vec![0u8; 65536],
             rx_pending: Vec::new(),
@@ -210,7 +212,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for KcpStream<S> {
         if got_input {
             // Acknowledge promptly, and let a blocked writer retry: ACKs free window space.
             this.kcp.flush_ack().map_err(kcp_err)?;
-            if let Some(waker) = this.write_waker.take() {
+            for waker in this.write_wakers.drain(..) {
                 waker.wake();
             }
         }
@@ -261,7 +263,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for KcpStream<S> {
             if let Poll::Ready(Err(e)) = this.poll_drain_output(cx) {
                 return Poll::Ready(Err(e));
             }
-            this.write_waker = Some(cx.waker().clone());
+            if !this.write_wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                this.write_wakers.push(cx.waker().clone());
+            }
             return Poll::Pending;
         }
 

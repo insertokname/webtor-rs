@@ -37,6 +37,8 @@ pub struct TlsStream<S> {
     record_read_buffer: Vec<u8>,
     /// Buffer for pending write data (encrypted, ready to send to transport)
     record_write_buffer: Vec<u8>,
+    /// Bytes of `record_write_buffer` already written to the transport
+    record_write_pos: usize,
 }
 
 /// Stored keying material for RFC 8446 key export
@@ -161,6 +163,7 @@ where
             keying_material,
             record_read_buffer: Vec::new(),
             record_write_buffer: Vec::new(),
+            record_write_pos: 0,
         })
     }
 
@@ -625,6 +628,42 @@ where
     }
 }
 
+impl<S> TlsStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    /// Write the already-encrypted bytes in `record_write_buffer` to the transport.
+    /// Ready(Ok) once all of it is written.
+    fn poll_write_buffered(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.record_write_pos < self.record_write_buffer.len() {
+            let pending = &self.record_write_buffer[self.record_write_pos..];
+            match Pin::new(&mut self.inner).poll_write(cx, pending) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write returned 0",
+                    )))
+                }
+                Poll::Ready(Ok(n)) => self.record_write_pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.record_write_buffer.clear();
+        self.record_write_pos = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
+// Standard AsyncWrite contract (as in rustls / futures-rustls):
+// - backpressure is applied *before* accepting data: while the previous record
+//   is still being written, poll_write returns Pending without consuming `buf`;
+// - once a record is encrypted the data counts as written (Ready(n)), even if the
+//   transport has not taken it yet. Returning Pending at that point made callers
+//   resend the same bytes, which were then encrypted a second time;
+// - one call encrypts at most one record of MAX_PLAINTEXT_SIZE bytes (RFC 8446
+//   5.1). Larger records made Tor relays drop the connection (record_overflow)
+//   as soon as more than 31 cells were written at once.
 impl<S> AsyncWrite for TlsStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -634,39 +673,18 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // First, flush any pending write buffer
-        while !self.record_write_buffer.is_empty() {
-            // Use mem::take to avoid clone while satisfying borrow checker
-            let mut pending = std::mem::take(&mut self.record_write_buffer);
-            let poll = Pin::new(&mut self.inner).poll_write(cx, &pending);
-            match poll {
-                Poll::Ready(Ok(0)) => {
-                    self.record_write_buffer = pending;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write returned 0",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    pending.drain(..n);
-                    self.record_write_buffer = pending;
-                }
-                Poll::Ready(Err(e)) => {
-                    self.record_write_buffer = pending;
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending => {
-                    self.record_write_buffer = pending;
-                    return Poll::Pending;
-                }
-            }
+        match self.poll_write_buffered(cx) {
+            Poll::Ready(Ok(())) => {}
+            other => return other.map(|r| r.map(|()| 0)),
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
         }
 
-        // Encrypt the new data and write it
-        // Encrypt using the record layer
+        let n = buf.len().min(crate::record::MAX_PLAINTEXT_SIZE);
         let encrypted = match self
             .record_layer
-            .encrypt_record_sync(CONTENT_TYPE_APPLICATION_DATA, buf)
+            .encrypt_record_sync(CONTENT_TYPE_APPLICATION_DATA, &buf[..n])
         {
             Ok(data) => data,
             Err(e) => {
@@ -676,61 +694,24 @@ where
                 )));
             }
         };
+        self.record_write_buffer = encrypted;
+        self.record_write_pos = 0;
 
-        // Try to write the encrypted record
-        match Pin::new(&mut self.inner).poll_write(cx, &encrypted) {
-            Poll::Ready(Ok(n)) => {
-                if n < encrypted.len() {
-                    // Partial write - buffer the rest
-                    self.record_write_buffer.extend_from_slice(&encrypted[n..]);
-                }
-                // Report how many plaintext bytes were written
-                Poll::Ready(Ok(buf.len()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => {
-                // Buffer all for later
-                self.record_write_buffer = encrypted;
-                Poll::Pending
-            }
+        // The record is accepted; start sending it (Pending is fine, it stays buffered).
+        if let Poll::Ready(Err(e)) = self.poll_write_buffered(cx) {
+            return Poll::Ready(Err(e));
         }
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Flush pending write buffer
-        while !self.record_write_buffer.is_empty() {
-            // Use mem::take to avoid clone while satisfying borrow checker
-            let mut pending = std::mem::take(&mut self.record_write_buffer);
-            let poll = Pin::new(&mut self.inner).poll_write(cx, &pending);
-            match poll {
-                Poll::Ready(Ok(0)) => {
-                    self.record_write_buffer = pending;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write returned 0",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    pending.drain(..n);
-                    self.record_write_buffer = pending;
-                }
-                Poll::Ready(Err(e)) => {
-                    self.record_write_buffer = pending;
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending => {
-                    self.record_write_buffer = pending;
-                    return Poll::Pending;
-                }
-            }
+        match self.poll_write_buffered(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_flush(cx),
+            other => other,
         }
-
-        // Flush underlying stream
-        Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // First flush pending data
         match self.as_mut().poll_flush(cx) {
             Poll::Ready(Ok(())) => {}
             other => return other,
@@ -915,4 +896,100 @@ fn hkdf_expand_label_sync(
 
     okm.truncate(length);
     Ok(okm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::task::noop_waker;
+
+    /// Transport that refuses the first write (Pending), then accepts everything.
+    #[derive(Default)]
+    struct SlowTransport {
+        refused_once: bool,
+        written: Vec<u8>,
+    }
+
+    impl AsyncRead for SlowTransport {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for SlowTransport {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if !self.refused_once {
+                self.refused_once = true;
+                return Poll::Pending;
+            }
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn stream(inner: SlowTransport) -> TlsStream<SlowTransport> {
+        TlsStream {
+            inner,
+            record_layer: RecordLayer::new(),
+            read_buffer: Vec::new(),
+            read_pos: 0,
+            peer_certificate: None,
+            keying_material: None,
+            record_read_buffer: Vec::new(),
+            record_write_buffer: Vec::new(),
+            record_write_pos: 0,
+        }
+    }
+
+    /// Large writes are split into records of at most 2^14 bytes, every byte
+    /// is sent exactly once even when the transport pushes back, and data is
+    /// never reported as written twice.
+    #[test]
+    fn writes_are_split_into_records_and_never_duplicated() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut tls = stream(SlowTransport::default());
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+
+        let mut accepted = 0;
+        let mut pending = 0;
+        while accepted < data.len() {
+            match Pin::new(&mut tls).poll_write(&mut cx, &data[accepted..]) {
+                Poll::Ready(Ok(n)) => {
+                    assert!(n > 0 && n <= crate::record::MAX_PLAINTEXT_SIZE);
+                    accepted += n;
+                }
+                Poll::Ready(Err(e)) => panic!("{e}"),
+                Poll::Pending => pending += 1,
+            }
+            assert!(pending < 10);
+        }
+        assert!(Pin::new(&mut tls).poll_flush(&mut cx).is_ready());
+
+        // Without a cipher the records carry the plaintext: parse them back.
+        let out = &tls.inner.written;
+        let mut payload = Vec::new();
+        let mut pos = 0;
+        while pos < out.len() {
+            let len = u16::from_be_bytes([out[pos + 3], out[pos + 4]]) as usize;
+            assert!(len <= crate::record::MAX_PLAINTEXT_SIZE);
+            payload.extend_from_slice(&out[pos + 5..pos + 5 + len]);
+            pos += 5 + len;
+        }
+        assert_eq!(payload, data);
+    }
 }

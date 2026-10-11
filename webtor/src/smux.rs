@@ -11,10 +11,12 @@
 //! - Bytes 8+: payload
 
 use crate::error::{Result, TorError};
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 use tracing::{debug, trace, warn};
 
 /// SMUX protocol version
@@ -23,8 +25,18 @@ const SMUX_VERSION: u8 = 2;
 /// Default stream ID
 const DEFAULT_STREAM_ID: u32 = 3;
 
-/// Default window size (64KB)
-const DEFAULT_WINDOW: u32 = 65535;
+/// The peer's window until its first UPD (smux-go `initialPeerWindow`).
+const INITIAL_PEER_WINDOW: u32 = 262144;
+
+/// Largest data frame payload (smux-go default `MaxFrameSize`).
+const MAX_FRAME_SIZE: usize = 32768;
+
+/// NOP interval (smux-go default `KeepAliveInterval`).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Fail the session when the bridge, which sends a NOP every 10 s, has sent
+/// nothing for this long.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Receive window we advertise to the peer. 64 KB capped
 /// throughput at ~64 KB per round trip, which is very slow through Tor.
@@ -215,16 +227,24 @@ impl SmuxState {
             self_increment: 0,
             self_window: RECEIVE_WINDOW,
             peer_consumed: 0,
-            peer_window: DEFAULT_WINDOW,
+            peer_window: INITIAL_PEER_WINDOW,
             syn_sent: false,
             syn_received: false,
         }
     }
 
-    /// Check if we can send more data
-    fn can_send(&self, len: usize) -> bool {
-        let inflight = self.self_write.saturating_sub(self.peer_consumed);
-        inflight + (len as u32) <= self.peer_window
+    /// Bytes the peer still lets us send, as smux-go computes it (modular
+    /// arithmetic on the 32-bit counters). Err if the peer claims to have
+    /// consumed more than we sent.
+    fn send_window(&self) -> io::Result<u32> {
+        let inflight = self.self_write.wrapping_sub(self.peer_consumed) as i32;
+        if inflight < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SMUX peer acknowledged more data than was sent",
+            ));
+        }
+        Ok((self.peer_window as i32).saturating_sub(inflight).max(0) as u32)
     }
 
     /// Check if we should send a window update
@@ -233,14 +253,32 @@ impl SmuxState {
     }
 }
 
+type Timer = Pin<Box<dyn Future<Output = ()>>>;
+
 /// SMUX multiplexed stream
+///
+/// Follows smux-go v2 (the Snowflake bridge side):
+/// - sending respects the peer's window (`peerWindow - (written - peerConsumed)`)
+///   from UPD frames; writers wait for an UPD when it is exhausted;
+/// - data frames are at most MAX_FRAME_SIZE bytes;
+/// - a NOP is sent every KEEPALIVE_INTERVAL (the bridge closes sessions that
+///   send nothing for 4 minutes), and the session fails loudly when the bridge,
+///   which pings every 10 s, sends nothing for KEEPALIVE_TIMEOUT.
 pub struct SmuxStream<S> {
     inner: S,
     state: SmuxState,
     read_buffer: Vec<u8>,
     data_buffer: Vec<u8>,
-    /// Encoded control frames (UPD) waiting to be written
+    /// Encoded control frames (UPD, NOP) waiting to be written
     pending_out: Vec<u8>,
+    /// Writer waiting for the peer to open its window
+    write_waker: Option<Waker>,
+    keepalive_interval: Duration,
+    keepalive_timeout: Duration,
+    keepalive_timer: Option<Timer>,
+    /// Keepalive intervals since the last frame from the peer
+    silent_intervals: u32,
+    fin_sent: bool,
 }
 
 impl<S> SmuxStream<S> {
@@ -255,6 +293,52 @@ impl<S> SmuxStream<S> {
             read_buffer: Vec::with_capacity(4096),
             data_buffer: Vec::new(),
             pending_out: Vec::new(),
+            write_waker: None,
+            keepalive_interval: KEEPALIVE_INTERVAL,
+            keepalive_timeout: KEEPALIVE_TIMEOUT,
+            keepalive_timer: None,
+            silent_intervals: 0,
+            fin_sent: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_keepalive(mut self, interval: Duration, timeout: Duration) -> Self {
+        self.keepalive_interval = interval;
+        self.keepalive_timeout = timeout;
+        self
+    }
+
+    /// On each keepalive tick: queue a NOP, and fail if the peer has been
+    /// silent for the keepalive timeout.
+    fn poll_keepalive(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        loop {
+            match self.keepalive_timer.as_mut() {
+                None => {}
+                Some(timer) => {
+                    if timer.as_mut().poll(cx).is_pending() {
+                        return Ok(());
+                    }
+                    self.silent_intervals += 1;
+                    if self.keepalive_interval * self.silent_intervals >= self.keepalive_timeout {
+                        warn!(
+                            "SMUX keepalive timeout: nothing from the bridge for {:?}",
+                            self.keepalive_timeout
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "SMUX keepalive timeout: nothing from the bridge for {:?}",
+                                self.keepalive_timeout
+                            ),
+                        ));
+                    }
+                    self.pending_out
+                        .extend_from_slice(&SmuxSegment::nop(0).encode());
+                }
+            }
+            self.keepalive_timer = Some(Box::pin(crate::retry::sleep(self.keepalive_interval)));
+            // Loop once more to poll the new timer, which registers our waker.
         }
     }
 }
@@ -292,19 +376,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SmuxStream<S> {
 
         // Send SYN
         let syn = SmuxSegment::syn(self.state.stream_id);
-        let syn_bytes = syn.encode();
-        debug!("SMUX SYN bytes: {:02x?}", syn_bytes);
         self.inner
-            .write_all(&syn_bytes)
+            .write_all(&syn.encode())
             .await
             .map_err(|e| TorError::Network(format!("Failed to send SMUX SYN: {}", e)))?;
 
         // Send initial window update
         let upd = SmuxSegment::upd(self.state.stream_id, 0, self.state.self_window);
-        let upd_bytes = upd.encode();
-        debug!("SMUX UPD bytes: {:02x?}", upd_bytes);
         self.inner
-            .write_all(&upd_bytes)
+            .write_all(&upd.encode())
             .await
             .map_err(|e| TorError::Network(format!("Failed to send SMUX UPD: {}", e)))?;
 
@@ -317,178 +397,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SmuxStream<S> {
         debug!("SMUX stream initialized");
 
         Ok(())
-    }
-
-    /// Send data
-    pub async fn send(&mut self, data: &[u8]) -> Result<usize> {
-        if !self.state.syn_sent {
-            self.initialize().await?;
-        }
-
-        // Check flow control
-        if !self.state.can_send(data.len()) {
-            // Wait for window update
-            self.process_incoming().await?;
-            if !self.state.can_send(data.len()) {
-                return Err(TorError::Network("SMUX window full".to_string()));
-            }
-        }
-
-        let segment = SmuxSegment::psh(self.state.stream_id, data.to_vec());
-        self.inner
-            .write_all(&segment.encode())
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to send SMUX data: {}", e)))?;
-
-        self.state.self_write = self.state.self_write.wrapping_add(data.len() as u32);
-
-        Ok(data.len())
-    }
-
-    /// Receive data
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-        // First drain data buffer
-        if !self.data_buffer.is_empty() {
-            let len = std::cmp::min(buf.len(), self.data_buffer.len());
-            buf[..len].copy_from_slice(&self.data_buffer[..len]);
-            self.data_buffer.drain(..len);
-            return Ok(len);
-        }
-
-        // Process incoming segments until we get data
-        loop {
-            if let Some(data) = self.process_next_segment().await? {
-                if data.is_empty() {
-                    continue;
-                }
-
-                let len = std::cmp::min(buf.len(), data.len());
-                buf[..len].copy_from_slice(&data[..len]);
-
-                if len < data.len() {
-                    self.data_buffer.extend_from_slice(&data[len..]);
-                }
-
-                return Ok(len);
-            }
-
-            // Read more data
-            let mut temp = [0u8; 4096];
-            let n = self
-                .inner
-                .read(&mut temp)
-                .await
-                .map_err(|e| TorError::Network(format!("SMUX read error: {}", e)))?;
-
-            if n == 0 {
-                return Ok(0); // EOF
-            }
-
-            self.read_buffer.extend_from_slice(&temp[..n]);
-        }
-    }
-
-    /// Process incoming data
-    async fn process_incoming(&mut self) -> Result<()> {
-        let mut temp = [0u8; 4096];
-
-        // Try non-blocking read
-        match futures::future::poll_fn(|cx| Pin::new(&mut self.inner).poll_read(cx, &mut temp))
-            .await
-        {
-            Ok(n) if n > 0 => {
-                self.read_buffer.extend_from_slice(&temp[..n]);
-            }
-            _ => {}
-        }
-
-        // Process all complete segments
-        while let Some(_) = self.process_next_segment().await? {}
-
-        Ok(())
-    }
-
-    /// Process next segment from buffer, returns data if PSH
-    async fn process_next_segment(&mut self) -> Result<Option<Vec<u8>>> {
-        let (segment, consumed) = match SmuxSegment::decode(&self.read_buffer)? {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        self.read_buffer.drain(..consumed);
-
-        // Validate stream ID (allow stream 0 for control messages)
-        if segment.stream_id != self.state.stream_id && segment.stream_id != 0 {
-            trace!(
-                "Ignoring SMUX segment for stream {} (expected {})",
-                segment.stream_id,
-                self.state.stream_id
-            );
-            return Ok(Some(Vec::new())); // Empty = no data but continue
-        }
-
-        match segment.command {
-            SmuxCommand::Syn => {
-                debug!("Received SMUX SYN for stream {}", segment.stream_id);
-                self.state.syn_received = true;
-                Ok(Some(Vec::new()))
-            }
-
-            SmuxCommand::Fin => {
-                debug!("Received SMUX FIN for stream {}", segment.stream_id);
-                Ok(None) // Signal EOF
-            }
-
-            SmuxCommand::Psh => {
-                trace!("Received SMUX PSH: {} bytes", segment.data.len());
-
-                // Update read counters
-                self.state.self_read = self.state.self_read.wrapping_add(segment.data.len() as u32);
-                self.state.self_increment = self
-                    .state
-                    .self_increment
-                    .wrapping_add(segment.data.len() as u32);
-
-                // Send window update if needed
-                if self.state.should_send_update() {
-                    let upd = SmuxSegment::upd(
-                        self.state.stream_id,
-                        self.state.self_read,
-                        self.state.self_window,
-                    );
-                    self.inner
-                        .write_all(&upd.encode())
-                        .await
-                        .map_err(|e| TorError::Network(format!("Failed to send UPD: {}", e)))?;
-                    self.state.self_increment = 0;
-                }
-
-                Ok(Some(segment.data))
-            }
-
-            SmuxCommand::Nop => {
-                trace!("Received SMUX NOP, sending NOP response");
-                // Respond with NOP (ping-pong)
-                let nop = SmuxSegment::nop(segment.stream_id);
-                self.inner
-                    .write_all(&nop.encode())
-                    .await
-                    .map_err(|e| TorError::Network(format!("Failed to send NOP: {}", e)))?;
-                Ok(Some(Vec::new()))
-            }
-
-            SmuxCommand::Upd => {
-                let update = SmuxUpdate::decode(&segment.data)?;
-                trace!(
-                    "Received SMUX UPD: consumed={}, window={}",
-                    update.consumed,
-                    update.window
-                );
-                self.state.peer_consumed = update.consumed;
-                self.state.peer_window = update.window;
-                Ok(Some(Vec::new()))
-            }
-        }
     }
 
     /// Close the stream
@@ -512,137 +420,103 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SmuxStream<S> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        trace!(
-            "SMUX poll_read: buf size {}, data_buffer size {}, read_buffer size {}",
-            buf.len(),
-            self.data_buffer.len(),
-            self.read_buffer.len()
-        );
+        let this = &mut *self;
+
+        this.poll_keepalive(cx)?;
+        // Control frames (UPD, NOP) go out from the read path too. Pending is fine:
+        // they stay queued and are retried on the next read or write.
+        if let Poll::Ready(Err(e)) = this.poll_drain_pending(cx) {
+            return Poll::Ready(Err(e));
+        }
 
         // Drain data buffer first
-        if !self.data_buffer.is_empty() {
-            let len = std::cmp::min(buf.len(), self.data_buffer.len());
-            buf[..len].copy_from_slice(&self.data_buffer[..len]);
-            self.data_buffer.drain(..len);
-            trace!("SMUX poll_read: returning {} bytes from data buffer", len);
+        if !this.data_buffer.is_empty() {
+            let len = std::cmp::min(buf.len(), this.data_buffer.len());
+            buf[..len].copy_from_slice(&this.data_buffer[..len]);
+            this.data_buffer.drain(..len);
             return Poll::Ready(Ok(len));
         }
 
-        // Try to decode from read buffer
         loop {
-            match SmuxSegment::decode(&self.read_buffer) {
-                Ok(Some((segment, consumed))) => {
-                    self.read_buffer.drain(..consumed);
+            // Decode every complete frame in the read buffer
+            while let Some((segment, consumed)) = SmuxSegment::decode(&this.read_buffer)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            {
+                this.read_buffer.drain(..consumed);
+                this.silent_intervals = 0;
 
-                    if segment.stream_id != self.state.stream_id && segment.stream_id != 0 {
-                        continue; // Wrong stream
+                if segment.stream_id != this.state.stream_id && segment.stream_id != 0 {
+                    continue; // Wrong stream
+                }
+
+                match segment.command {
+                    SmuxCommand::Syn => {
+                        debug!("SMUX: received SYN for stream {}", segment.stream_id);
+                        this.state.syn_received = true;
                     }
+                    SmuxCommand::Psh => {
+                        let len = segment.data.len() as u32;
+                        this.state.self_read = this.state.self_read.wrapping_add(len);
+                        this.state.self_increment = this.state.self_increment.wrapping_add(len);
 
-                    match segment.command {
-                        SmuxCommand::Syn => {
-                            debug!(
-                                "SMUX poll_read: received SYN for stream {}",
-                                segment.stream_id
+                        // Without window updates the peer stops sending after
+                        // its initial window (silent stall).
+                        if this.state.should_send_update() {
+                            let upd = SmuxSegment::upd(
+                                this.state.stream_id,
+                                this.state.self_read,
+                                this.state.self_window,
                             );
-                            self.state.syn_received = true;
+                            this.pending_out.extend_from_slice(&upd.encode());
+                            this.state.self_increment = 0;
+                        }
+                        if let Poll::Ready(Err(e)) = this.poll_drain_pending(cx) {
+                            return Poll::Ready(Err(e));
+                        }
+
+                        if segment.data.is_empty() {
                             continue;
                         }
-                        SmuxCommand::Psh => {
-                            debug!(
-                                "SMUX poll_read: received PSH {} bytes for stream {}",
-                                segment.data.len(),
-                                segment.stream_id
-                            );
-                            self.state.self_read =
-                                self.state.self_read.wrapping_add(segment.data.len() as u32);
-                            self.state.self_increment = self
-                                .state
-                                .self_increment
-                                .wrapping_add(segment.data.len() as u32);
-
-                            // Window updates must be sent from this path too, otherwise
-                            // the peer stops sending after ~256 KB (silent stall).
-                            if self.state.should_send_update() {
-                                let upd = SmuxSegment::upd(
-                                    self.state.stream_id,
-                                    self.state.self_read,
-                                    self.state.self_window,
-                                );
-                                self.pending_out.extend_from_slice(&upd.encode());
-                                self.state.self_increment = 0;
-                            }
-                            if let Poll::Ready(Err(e)) = self.poll_drain_pending(cx) {
-                                return Poll::Ready(Err(e));
-                            }
-
-                            let len = std::cmp::min(buf.len(), segment.data.len());
-                            buf[..len].copy_from_slice(&segment.data[..len]);
-
-                            if len < segment.data.len() {
-                                self.data_buffer.extend_from_slice(&segment.data[len..]);
-                            }
-
-                            return Poll::Ready(Ok(len));
+                        let len = std::cmp::min(buf.len(), segment.data.len());
+                        buf[..len].copy_from_slice(&segment.data[..len]);
+                        if len < segment.data.len() {
+                            this.data_buffer.extend_from_slice(&segment.data[len..]);
                         }
-                        SmuxCommand::Fin => {
-                            debug!(
-                                "SMUX poll_read: received FIN for stream {}",
-                                segment.stream_id
-                            );
-                            return Poll::Ready(Ok(0)); // EOF
-                        }
-                        SmuxCommand::Upd => {
-                            if let Ok(update) = SmuxUpdate::decode(&segment.data) {
-                                debug!(
-                                    "SMUX poll_read: received UPD consumed={}, window={}",
-                                    update.consumed, update.window
-                                );
-                                self.state.peer_consumed = update.consumed;
-                                self.state.peer_window = update.window;
-                            }
-                            continue;
-                        }
-                        SmuxCommand::Nop => {
-                            debug!("SMUX poll_read: received NOP");
-                            continue;
+                        return Poll::Ready(Ok(len));
+                    }
+                    SmuxCommand::Fin => {
+                        debug!("SMUX: received FIN for stream {}", segment.stream_id);
+                        return Poll::Ready(Ok(0)); // EOF
+                    }
+                    SmuxCommand::Upd => {
+                        let update = SmuxUpdate::decode(&segment.data).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+                        trace!(
+                            "SMUX: received UPD consumed={}, window={}",
+                            update.consumed,
+                            update.window
+                        );
+                        this.state.peer_consumed = update.consumed;
+                        this.state.peer_window = update.window;
+                        if let Some(waker) = this.write_waker.take() {
+                            waker.wake();
                         }
                     }
-                }
-                Ok(None) => break, // Need more data
-                Err(e) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        e.to_string(),
-                    )))
+                    SmuxCommand::Nop => {}
                 }
             }
-        }
 
-        // Read more data
-        trace!("SMUX poll_read: need more data, reading from inner");
-        let mut temp = [0u8; 4096];
-        match Pin::new(&mut self.inner).poll_read(cx, &mut temp) {
-            Poll::Ready(Ok(0)) => {
-                trace!("SMUX poll_read: inner EOF");
-                Poll::Ready(Ok(0))
-            }
-            Poll::Ready(Ok(n)) => {
-                debug!(
-                    "SMUX poll_read: got {} bytes from inner: {:02x?}",
-                    n,
-                    &temp[..n]
-                );
-                self.read_buffer.extend_from_slice(&temp[..n]);
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(Err(e)) => {
-                warn!("SMUX poll_read: inner error: {}", e);
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => {
-                trace!("SMUX poll_read: inner pending");
-                Poll::Pending
+            // Read more data
+            let mut temp = [0u8; 4096];
+            match Pin::new(&mut this.inner).poll_read(cx, &mut temp) {
+                Poll::Ready(Ok(0)) => return Poll::Ready(Ok(0)),
+                Poll::Ready(Ok(n)) => this.read_buffer.extend_from_slice(&temp[..n]),
+                Poll::Ready(Err(e)) => {
+                    warn!("SMUX poll_read: inner error: {}", e);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -659,41 +533,30 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SmuxStream<S> {
             Poll::Ready(Ok(())) => {}
             other => return other.map(|r| r.map(|()| 0)),
         }
-
-        // Check flow control
-        if !self.state.can_send(buf.len()) {
-            // For now, just try anyway - proper impl would wait
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
         }
 
-        // NOTE: We encode the entire frame and expect it to be written atomically.
-        // Partial writes will return WriteZero error. This is acceptable because:
-        // 1. SMUX frames are small (typically <64KB) and TCP usually handles them atomically
-        // 2. Proper partial-write buffering would add significant complexity
-        // 3. On WriteZero error, the connection is corrupted and unrecoverable
-        //
-        // Recovery: WriteZero means framing is broken. The caller MUST close the connection
-        // and establish a new one. Retrying on the same connection will send malformed data.
-        let segment = SmuxSegment::psh(self.state.stream_id, buf.to_vec());
-        let encoded = segment.encode();
-        debug!(
-            "SMUX poll_write: sending {} bytes data as {} byte frame: {:02x?}",
-            buf.len(),
-            encoded.len(),
-            &encoded[..std::cmp::min(32, encoded.len())]
-        );
+        // Flow control: wait for an UPD (seen by poll_read) while the peer's window is full.
+        let window = self.state.send_window()?;
+        if window == 0 {
+            trace!("SMUX poll_write: peer window full, waiting for UPD");
+            self.write_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
 
+        // The inner (KCP) stream takes a whole frame or nothing, so a frame is never torn.
+        let n = buf.len().min(window as usize).min(MAX_FRAME_SIZE);
+        let encoded = SmuxSegment::psh(self.state.stream_id, buf[..n].to_vec()).encode();
         match Pin::new(&mut self.inner).poll_write(cx, &encoded) {
-            Poll::Ready(Ok(n)) => {
-                if n == encoded.len() {
-                    self.state.self_write = self.state.self_write.wrapping_add(buf.len() as u32);
-                    Poll::Ready(Ok(buf.len()))
-                } else {
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "Partial SMUX write",
-                    )))
-                }
+            Poll::Ready(Ok(written)) if written == encoded.len() => {
+                self.state.self_write = self.state.self_write.wrapping_add(n as u32);
+                Poll::Ready(Ok(n))
             }
+            Poll::Ready(Ok(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "Partial SMUX write",
+            ))),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
@@ -707,14 +570,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SmuxStream<S> {
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Send FIN before closing
-        let fin = SmuxSegment::fin(self.state.stream_id);
-        let encoded = fin.encode();
-
-        match Pin::new(&mut self.inner).poll_write(cx, &encoded) {
-            Poll::Ready(Ok(_)) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
+        // Send FIN (once) before closing
+        if !self.fin_sent {
+            let fin = SmuxSegment::fin(self.state.stream_id).encode();
+            match Pin::new(&mut self.inner).poll_write(cx, &fin) {
+                Poll::Ready(Ok(_)) => self.fin_sent = true,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
 
         Pin::new(&mut self.inner).poll_close(cx)
@@ -724,6 +587,229 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SmuxStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use futures::task::{waker, ArcWake};
+    use futures::AsyncReadExt;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// In-memory peer: bytes queued in `rx` are read by the stream, written
+    /// bytes collect in `tx`.
+    #[derive(Clone, Default)]
+    struct MockPeer(Arc<Mutex<MockPeerState>>);
+
+    #[derive(Default)]
+    struct MockPeerState {
+        rx: VecDeque<u8>,
+        tx: Vec<u8>,
+        read_waker: Option<Waker>,
+    }
+
+    impl MockPeer {
+        fn deliver(&self, bytes: &[u8]) {
+            let mut state = self.0.lock().unwrap();
+            state.rx.extend(bytes);
+            if let Some(w) = state.read_waker.take() {
+                w.wake();
+            }
+        }
+
+        /// Decodes everything written so far into frames.
+        fn sent_frames(&self) -> Vec<SmuxSegment> {
+            let state = self.0.lock().unwrap();
+            let mut frames = Vec::new();
+            let mut pos = 0;
+            while let Some((segment, n)) = SmuxSegment::decode(&state.tx[pos..]).unwrap() {
+                frames.push(segment);
+                pos += n;
+            }
+            assert_eq!(pos, state.tx.len(), "torn frame in output");
+            frames
+        }
+    }
+
+    impl AsyncRead for MockPeer {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut state = self.0.lock().unwrap();
+            if state.rx.is_empty() {
+                state.read_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            let n = buf.len().min(state.rx.len());
+            for (i, b) in state.rx.drain(..n).enumerate() {
+                buf[i] = b;
+            }
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl AsyncWrite for MockPeer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.lock().unwrap().tx.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+    impl ArcWake for WakeCounter {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Writes as much of `data` as the stream accepts without blocking.
+    fn write_until_pending(
+        stream: &mut SmuxStream<MockPeer>,
+        data: &[u8],
+        cx: &mut Context<'_>,
+    ) -> usize {
+        let mut written = 0;
+        while written < data.len() {
+            match Pin::new(&mut *stream).poll_write(cx, &data[written..]) {
+                Poll::Ready(Ok(n)) => {
+                    assert!(n > 0);
+                    written += n;
+                }
+                Poll::Ready(Err(e)) => panic!("write failed: {e}"),
+                Poll::Pending => break,
+            }
+        }
+        written
+    }
+
+    #[tokio::test]
+    async fn large_write_respects_peer_window() {
+        let peer = MockPeer::default();
+        let mut stream = SmuxStream::with_stream_id(peer.clone(), 3);
+        let counter = Arc::new(WakeCounter::default());
+        let w = waker(counter.clone());
+        let mut cx = Context::from_waker(&w);
+        let data: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i * 7 % 251) as u8).collect();
+
+        // Before any UPD the peer's window is smux-go's initial 256 KB.
+        let mut written = write_until_pending(&mut stream, &data, &mut cx);
+        assert_eq!(written, INITIAL_PEER_WINDOW as usize);
+
+        // The peer consumed 128 KB and advertises 1 MB (Snowflake's MaxStreamBuffer):
+        // reading the UPD wakes the blocked writer, which may then fill the window.
+        peer.deliver(&SmuxSegment::upd(3, 128 * 1024, 1024 * 1024).encode());
+        let mut buf = [0u8; 16];
+        assert!(Pin::new(&mut stream)
+            .poll_read(&mut cx, &mut buf)
+            .is_pending());
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "writer was not woken by UPD"
+        );
+        written += write_until_pending(&mut stream, &data[written..], &mut cx);
+        assert_eq!(written, 128 * 1024 + 1024 * 1024);
+
+        let mut payload = Vec::new();
+        for frame in peer.sent_frames() {
+            if frame.command == SmuxCommand::Psh {
+                assert!(frame.data.len() <= MAX_FRAME_SIZE);
+                payload.extend_from_slice(&frame.data);
+            }
+        }
+        assert_eq!(payload, data[..written]);
+    }
+
+    #[tokio::test]
+    async fn bogus_update_is_an_error() {
+        let peer = MockPeer::default();
+        let mut stream = SmuxStream::with_stream_id(peer.clone(), 3);
+        let counter = Arc::new(WakeCounter::default());
+        let w = waker(counter);
+        let mut cx = Context::from_waker(&w);
+
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, &[1u8; 100]),
+            Poll::Ready(Ok(100))
+        ));
+        peer.deliver(&SmuxSegment::upd(3, 1000, 65536).encode());
+        let mut buf = [0u8; 16];
+        assert!(Pin::new(&mut stream)
+            .poll_read(&mut cx, &mut buf)
+            .is_pending());
+        match Pin::new(&mut stream).poll_write(&mut cx, &[1u8; 100]) {
+            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_window_updates_while_reading() {
+        let peer = MockPeer::default();
+        let mut stream = SmuxStream::with_stream_id(peer.clone(), 3);
+        for _ in 0..4 {
+            peer.deliver(&SmuxSegment::psh(3, vec![0u8; 16 * 1024]).encode());
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut read = 0;
+        while read < 64 * 1024 {
+            read += stream.read(&mut buf).await.unwrap();
+        }
+        let updates: Vec<_> = peer
+            .sent_frames()
+            .into_iter()
+            .filter(|f| f.command == SmuxCommand::Upd)
+            .map(|f| SmuxUpdate::decode(&f.data).unwrap())
+            .collect();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1].consumed, 64 * 1024);
+        assert_eq!(updates[1].window, RECEIVE_WINDOW);
+    }
+
+    #[tokio::test]
+    async fn keepalive_pings_and_times_out_when_peer_is_silent() {
+        let peer = MockPeer::default();
+        let mut stream = SmuxStream::with_stream_id(peer.clone(), 3)
+            .with_keepalive(Duration::from_millis(20), Duration::from_millis(100));
+        let mut buf = [0u8; 16];
+        let err = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let nops = peer
+            .sent_frames()
+            .iter()
+            .filter(|f| f.command == SmuxCommand::Nop)
+            .count();
+        assert!(nops >= 3, "only {nops} NOPs sent");
+    }
+
+    #[tokio::test]
+    async fn keepalive_survives_while_peer_pings() {
+        let peer = MockPeer::default();
+        let mut stream = SmuxStream::with_stream_id(peer.clone(), 3)
+            .with_keepalive(Duration::from_millis(20), Duration::from_millis(100));
+        let pinger = peer.clone();
+        let ping = tokio::spawn(async move {
+            for _ in 0..15 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                pinger.deliver(&SmuxSegment::nop(0).encode());
+            }
+            pinger.deliver(&SmuxSegment::psh(3, b"done".to_vec()).encode());
+        });
+        let mut buf = [0u8; 16];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"done");
+        ping.await.unwrap();
+    }
 
     #[test]
     fn test_segment_encode_decode() {
