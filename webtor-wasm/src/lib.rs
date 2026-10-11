@@ -1043,7 +1043,36 @@ impl SignalSocket {
         headers: JsValue,
         timeout_ms: u32,
     ) -> js_sys::Promise {
-        let carrier = tor_carrier(client);
+        Self::open_on(tor_carrier(client), url, root_pem, headers, timeout_ms)
+    }
+
+    /// Tests only (feature `test-relay`): like `open`, carried by a WebSocket
+    /// to the local relay at `relay_url` instead of Tor.
+    #[cfg(feature = "test-relay")]
+    #[wasm_bindgen(js_name = openRelay)]
+    pub fn open_relay(
+        relay_url: String,
+        url: String,
+        root_pem: String,
+        headers: JsValue,
+        timeout_ms: u32,
+    ) -> js_sys::Promise {
+        Self::open_on(
+            Ok(Carrier::Relay(relay_url)),
+            url,
+            root_pem,
+            headers,
+            timeout_ms,
+        )
+    }
+
+    fn open_on(
+        carrier: Result<Carrier, JsValue>,
+        url: String,
+        root_pem: String,
+        headers: JsValue,
+        timeout_ms: u32,
+    ) -> js_sys::Promise {
         let headers = header_list_from_js(headers);
         future_to_promise(async move {
             let carrier = carrier?;
@@ -1162,6 +1191,15 @@ impl SignalHttps {
         Ok(SignalHttps {
             inner: std::rc::Rc::new(SignalHttpsClient::new(tor_carrier(client)?)),
         })
+    }
+
+    /// Tests only (feature `test-relay`): requests carried by WebSockets to
+    /// the local relay at `relay_url` instead of Tor.
+    #[cfg(feature = "test-relay")]
+    pub fn relay(relay_url: String) -> SignalHttps {
+        SignalHttps {
+            inner: std::rc::Rc::new(SignalHttpsClient::new(Carrier::Relay(relay_url))),
+        }
     }
 
     /// Resolves to `{ status, headers, body }` (headers as [name, value]

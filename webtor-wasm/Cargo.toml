@@ -10,6 +10,11 @@ description = "WebAssembly bindings for webtor"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Test builds only: SignalSocket.openRelay / SignalHttps.relay (see
+# webtor's Carrier::Relay). Production builds leave it off.
+test-relay = ["webtor/test-relay"]
+
 [dependencies]
 webtor = { path = "../webtor" }
 http = { workspace = true }

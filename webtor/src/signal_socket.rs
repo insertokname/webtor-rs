@@ -40,6 +40,12 @@ pub type SignalWebSocket = WebSocketStream<SignalTlsStream>;
 #[derive(Clone)]
 pub enum Carrier {
     Tor(Arc<TorClient>),
+    /// Tests only (feature `test-relay`, never in production builds): a
+    /// WebSocket to a local relay, `<relay url>?host=<host>&port=<port>`,
+    /// that forwards the bytes to a mock server. TLS still runs end to end
+    /// on top, pinned to the root the caller supplies.
+    #[cfg(feature = "test-relay")]
+    Relay(String),
 }
 
 impl Carrier {
@@ -47,6 +53,17 @@ impl Carrier {
     pub async fn connect(&self, host: &str, port: u16) -> Result<BoxedCarrierStream> {
         match self {
             Carrier::Tor(client) => Ok(Box::pin(client.open_stream(host, port).await?)),
+            #[cfg(feature = "test-relay")]
+            Carrier::Relay(relay) => {
+                let mut url = url::Url::parse(relay)
+                    .map_err(|e| TorError::Network(format!("invalid relay URL: {}", e)))?;
+                url.query_pairs_mut()
+                    .append_pair("host", host)
+                    .append_pair("port", &port.to_string());
+                Ok(Box::pin(
+                    crate::websocket::WebSocketStream::connect(url.as_str()).await?,
+                ))
+            }
         }
     }
 }
