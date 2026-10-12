@@ -11,6 +11,7 @@
 //! - Bytes 8+: payload
 
 use crate::error::{Result, TorError};
+use crate::time::Instant;
 use futures::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use std::future::Future;
 use std::io;
@@ -34,9 +35,20 @@ const MAX_FRAME_SIZE: usize = 32768;
 /// NOP interval (smux-go default `KeepAliveInterval`).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Fail the session when the bridge, which sends a NOP every 10 s, has sent
-/// nothing for this long.
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Fail the session when the bridge, which sends a NOP every 10 s (smux-go's
+/// default, the Snowflake server's setting), has sent nothing for this long:
+/// two NOPs missed plus room for retransmissions. A connection that
+/// silently stopped delivering is noticed after 25-30 s, an idle one that
+/// works never is.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// How often the silence is checked.
+const KEEPALIVE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// After a check that ran three intervals late (the page was suspended or
+/// its timers throttled), the bridge gets this long to be heard from before
+/// the session fails: what it sent meanwhile may still be queued.
+const KEEPALIVE_GRACE: Duration = Duration::from_secs(15);
 
 /// Receive window we advertise to the peer. 64 KB capped
 /// throughput at ~64 KB per round trip, which is very slow through Tor.
@@ -275,9 +287,15 @@ pub struct SmuxStream<S> {
     write_waker: Option<Waker>,
     keepalive_interval: Duration,
     keepalive_timeout: Duration,
+    keepalive_check_interval: Duration,
+    keepalive_grace: Duration,
     keepalive_timer: Option<Timer>,
-    /// Keepalive intervals since the last frame from the peer
-    silent_intervals: u32,
+    /// When the last frame from the peer arrived
+    last_heard: Instant,
+    last_nop: Instant,
+    last_check: Instant,
+    /// Whether the previous check ran late too (grace is given once in a row)
+    late_check: bool,
     fin_sent: bool,
 }
 
@@ -296,8 +314,13 @@ impl<S> SmuxStream<S> {
             write_waker: None,
             keepalive_interval: KEEPALIVE_INTERVAL,
             keepalive_timeout: KEEPALIVE_TIMEOUT,
+            keepalive_check_interval: KEEPALIVE_CHECK_INTERVAL,
+            keepalive_grace: KEEPALIVE_GRACE,
             keepalive_timer: None,
-            silent_intervals: 0,
+            last_heard: Instant::now(),
+            last_nop: Instant::now(),
+            last_check: Instant::now(),
+            late_check: false,
             fin_sent: false,
         }
     }
@@ -306,40 +329,60 @@ impl<S> SmuxStream<S> {
     fn with_keepalive(mut self, interval: Duration, timeout: Duration) -> Self {
         self.keepalive_interval = interval;
         self.keepalive_timeout = timeout;
+        self.keepalive_check_interval = interval / 2;
+        self.keepalive_grace = timeout / 2;
         self
     }
 
-    /// On each keepalive tick: queue a NOP, and fail if the peer has been
-    /// silent for the keepalive timeout.
+    /// On each check: queue a NOP when one is due, and fail if the peer has
+    /// been silent for the keepalive timeout.
     fn poll_keepalive(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         loop {
-            match self.keepalive_timer.as_mut() {
-                None => {}
-                Some(timer) => {
-                    if timer.as_mut().poll(cx).is_pending() {
-                        return Ok(());
-                    }
-                    self.silent_intervals += 1;
-                    if self.keepalive_interval * self.silent_intervals >= self.keepalive_timeout {
-                        warn!(
-                            "SMUX keepalive timeout: nothing from the bridge for {:?}",
-                            self.keepalive_timeout
-                        );
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!(
-                                "SMUX keepalive timeout: nothing from the bridge for {:?}",
-                                self.keepalive_timeout
-                            ),
-                        ));
-                    }
-                    self.pending_out
-                        .extend_from_slice(&SmuxSegment::nop(0).encode());
+            if let Some(timer) = self.keepalive_timer.as_mut() {
+                if timer.as_mut().poll(cx).is_pending() {
+                    return Ok(());
                 }
+                self.check_keepalive()?;
             }
-            self.keepalive_timer = Some(Box::pin(crate::retry::sleep(self.keepalive_interval)));
+            self.keepalive_timer =
+                Some(Box::pin(crate::retry::sleep(self.keepalive_check_interval)));
             // Loop once more to poll the new timer, which registers our waker.
         }
+    }
+
+    fn check_keepalive(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        let late = now.duration_since(self.last_check) >= self.keepalive_check_interval * 3;
+        self.last_check = now;
+        if late && !self.late_check {
+            // As if last heard just long enough ago to fail after the grace.
+            let floor = now - (self.keepalive_timeout - self.keepalive_grace);
+            if floor.duration_since(self.last_heard) > Duration::ZERO {
+                debug!(
+                    "SMUX keepalive check ran late; waiting {:?} for the bridge",
+                    self.keepalive_grace
+                );
+                self.last_heard = floor;
+            }
+        }
+        self.late_check = late;
+        let silent = now.duration_since(self.last_heard);
+        if silent >= self.keepalive_timeout {
+            warn!("SMUX keepalive timeout: nothing from the bridge for {silent:?}");
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "SMUX keepalive timeout: nothing from the bridge for {}s",
+                    silent.as_secs()
+                ),
+            ));
+        }
+        if now.duration_since(self.last_nop) >= self.keepalive_interval {
+            self.last_nop = now;
+            self.pending_out
+                .extend_from_slice(&SmuxSegment::nop(0).encode());
+        }
+        Ok(())
     }
 }
 
@@ -443,7 +486,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SmuxStream<S> {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
             {
                 this.read_buffer.drain(..consumed);
-                this.silent_intervals = 0;
+                this.last_heard = Instant::now();
 
                 if segment.stream_id != this.state.stream_id && segment.stream_id != 0 {
                     continue; // Wrong stream
@@ -809,6 +852,40 @@ mod tests {
         let n = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"done");
         ping.await.unwrap();
+    }
+
+    #[test]
+    fn late_check_gives_grace_once() {
+        let peer = MockPeer::default();
+        let mut stream = SmuxStream::with_stream_id(peer, 3)
+            .with_keepalive(Duration::from_millis(200), Duration::from_millis(1000));
+        // Silent for longer than the timeout, but the check itself ran late.
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(1100));
+        stream.last_heard = start;
+        stream.last_check = start;
+        stream
+            .check_keepalive()
+            .expect("a late check waits for the bridge");
+        // The next checks are on time: within the grace (500 ms), then past it.
+        std::thread::sleep(Duration::from_millis(250));
+        stream.check_keepalive().expect("still within the grace");
+        std::thread::sleep(Duration::from_millis(280));
+        let err = stream.check_keepalive().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn on_time_check_fails_after_silence() {
+        let peer = MockPeer::default();
+        let mut stream = SmuxStream::with_stream_id(peer, 3)
+            .with_keepalive(Duration::from_millis(200), Duration::from_millis(300));
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(320));
+        stream.last_heard = start;
+        stream.last_check = Instant::now() - Duration::from_millis(100);
+        let err = stream.check_keepalive().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

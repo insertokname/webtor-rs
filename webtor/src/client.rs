@@ -375,6 +375,11 @@ impl TorClient {
             warn!("Error during circuit cleanup: {}", e);
         }
 
+        // And the connection to the bridge
+        if let Some(channel) = self.channel.write().await.take() {
+            channel.terminate();
+        }
+
         *self.is_initialized.write().await = false;
         info!("Tor client closed");
     }
@@ -391,6 +396,31 @@ impl TorClient {
         };
         let circuit_read = circuit.read().await;
         circuit_read.begin_stream(host, port).await
+    }
+
+    /// Resolves once the channel to the bridge has closed (or the client was
+    /// closed), with the reason. A channel that silently stopped delivering
+    /// closes when the bridge has not been heard from for the SMUX keepalive
+    /// timeout. Fails if no channel was established.
+    pub async fn wait_for_channel_close(&self) -> Result<String> {
+        let channel = self
+            .channel
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| TorError::Internal("Channel not established".to_string()))?;
+        let closed = channel.wait_for_close();
+        drop(channel);
+        tokio::select! {
+            result = closed => Ok(match result {
+                Ok(_) => "channel closed".to_string(),
+                Err(tor_proto::channel::ClosedUnexpectedly::ReactorError(e)) => {
+                    format!("channel closed: {e}")
+                }
+                Err(e) => format!("channel closed: {e}"),
+            }),
+            () = self.shutdown_token.cancelled() => Ok("client closed".to_string()),
+        }
     }
 
     /// Abort all in-flight operations.
@@ -415,17 +445,29 @@ impl TorClient {
     /// Establish the Tor channel (called during construction if requested)
     async fn establish_channel(&self) -> Result<()> {
         let timeout = self.options.connection_timeout_duration();
-        with_timeout_and_cancellation(
+        // How far it got, for the timeout's message.
+        let stage = std::sync::Mutex::new("connecting to the bridge");
+        let result = with_timeout_and_cancellation(
             timeout,
             "establish_channel",
             &self.shutdown_token,
-            self.establish_channel_impl(),
+            self.establish_channel_impl(&stage),
         )
-        .await
+        .await;
+        match result {
+            Err(TorError::Timeout(message)) => {
+                let stage = *stage.lock().unwrap_or_else(|e| e.into_inner());
+                Err(TorError::Timeout(format!("{message} while {stage}")))
+            }
+            other => other,
+        }
     }
 
     /// Internal implementation of establish_channel (without timeout wrapper)
-    async fn establish_channel_impl(&self) -> Result<()> {
+    async fn establish_channel_impl(&self, stage: &std::sync::Mutex<&'static str>) -> Result<()> {
+        let set_stage = |now: &'static str| {
+            *stage.lock().unwrap_or_else(|e| e.into_inner()) = now;
+        };
         self.log("Establishing channel", LogType::Info);
 
         let timeout = self.options.connection_timeout_duration();
@@ -482,6 +524,7 @@ impl TorClient {
                         "Connected to Snowflake bridge via WebSocket",
                         LogType::Success,
                     );
+                    set_stage("doing the Tor handshake with the bridge");
                     self.create_channel_from_stream(stream, rsa_id).await?
                 }
                 #[cfg(not(target_arch = "wasm32"))]
@@ -512,6 +555,7 @@ impl TorClient {
                     let bridge = SnowflakeBridge::with_config(config);
                     let stream = bridge.connect().await?;
                     self.log("Connected to Snowflake bridge via WebRTC", LogType::Success);
+                    set_stage("doing the Tor handshake with the bridge");
                     self.create_channel_from_stream(stream, rsa_id).await?
                 }
                 #[cfg(not(target_arch = "wasm32"))]
@@ -553,6 +597,7 @@ impl TorClient {
         self.log("Channel established", LogType::Success);
 
         if !self.directory_manager.has_directory().await {
+            set_stage("fetching the Tor directory through the bridge");
             self.log(
                 "Fetching the Tor directory through the bridge...",
                 LogType::Info,
@@ -572,6 +617,7 @@ impl TorClient {
         }
 
         // Now create the actual circuit through the Tor network
+        set_stage("building the first circuit");
         self.log("Creating circuit through Tor network...", LogType::Info);
 
         let circuit_manager = self.circuit_manager.read().await;

@@ -531,6 +531,28 @@ impl TorClient {
         })
     }
 
+    /// Resolves with the reason once the connection to the bridge has
+    /// closed (a bridge not heard from for the SMUX keepalive timeout closes
+    /// it) or the client was closed.
+    #[wasm_bindgen(js_name = waitForChannelClose)]
+    pub fn wait_for_channel_close(&self) -> js_sys::Promise {
+        let client = match &self.inner {
+            Some(client) => client.clone(),
+            None => {
+                return future_to_promise(async move {
+                    Err(JsTorError::not_initialized().into_js_value())
+                });
+            }
+        };
+        future_to_promise(async move {
+            client
+                .wait_for_channel_close()
+                .await
+                .map(|reason| JsValue::from_str(&reason))
+                .map_err(tor_error_to_js)
+        })
+    }
+
     /// Get circuit status
     #[wasm_bindgen(js_name = getCircuitStatus)]
     pub fn get_circuit_status(&self) -> js_sys::Promise {
