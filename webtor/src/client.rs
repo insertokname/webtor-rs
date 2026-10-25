@@ -28,6 +28,10 @@ use tor_proto::memquota::{ChannelAccount, SpecificAccount};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+/// How long fetching the Tor directory through the bridge may take (a few MB
+/// over a slow bridge), when the snapshot served with the page is not usable.
+pub const DIRECTORY_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Main Tor client that manages circuits and HTTP requests
 pub struct TorClient {
     options: TorClientOptions,
@@ -504,19 +508,101 @@ impl TorClient {
         &self.shutdown_token
     }
 
-    /// Establish the Tor channel (called during construction if requested)
+    /// Establish the Tor channel (called during construction if requested).
+    /// Each stage has its own time limit: connecting to the bridge and
+    /// building the first circuit the configured connection timeout, fetching
+    /// the directory through the bridge (only when the snapshot served with
+    /// the page is not usable) DIRECTORY_FETCH_TIMEOUT, so that a slow bridge
+    /// that has just sent the directory is not given up on.
     async fn establish_channel(&self) -> Result<()> {
         let timeout = self.options.connection_timeout_duration();
         // How far it got, for the timeout's message.
         let stage = std::sync::Mutex::new("connecting to the bridge");
-        let result = with_timeout_and_cancellation(
-            timeout,
-            "establish_channel",
-            &self.shutdown_token,
-            self.establish_channel_impl(&stage),
-        )
-        .await;
-        match result {
+        let set_stage = |now: &'static str| {
+            *stage.lock().unwrap_or_else(|e| e.into_inner()) = now;
+        };
+
+        let chan = self
+            .within_stage(timeout, &stage, self.connect_bridge(&stage))
+            .await?;
+
+        // Store the channel to keep it alive
+        *self.channel.write().await = Some(chan.clone());
+
+        self.log("Channel established", LogType::Success);
+
+        if !self.directory_manager.has_directory().await {
+            set_stage("fetching the Tor directory through the bridge");
+            self.log(
+                "Fetching the Tor directory through the bridge...",
+                LogType::Info,
+            );
+            let fetched = self
+                .within_stage(
+                    DIRECTORY_FETCH_TIMEOUT,
+                    &stage,
+                    self.directory_manager.fetch_and_process_consensus(chan),
+                )
+                .await;
+            match fetched {
+                Ok(_) => {}
+                Err(e @ (TorError::Timeout(_) | TorError::Cancelled)) => return Err(e),
+                Err(e) => {
+                    let reason = match self.directory_manager.snapshot_error() {
+                        Some(snapshot) => format!("snapshot: {snapshot}; from the bridge: {e}"),
+                        None => format!("from the bridge: {e}"),
+                    };
+                    self.log(&format!("Tor directory unusable: {reason}"), LogType::Error);
+                    return Err(TorError::Directory(reason));
+                }
+            }
+        }
+
+        // Now create the actual circuit through the Tor network
+        set_stage("building the first circuit");
+        self.log("Creating circuit through Tor network...", LogType::Info);
+
+        let circuit_manager = self.circuit_manager.read().await.clone();
+        match self
+            .within_stage(timeout, &stage, circuit_manager.create_circuit())
+            .await
+        {
+            Ok(circuit) => {
+                let circuit_info = circuit.read().await;
+                let relay_names: Vec<_> = circuit_info
+                    .relays
+                    .iter()
+                    .map(|r| r.nickname.clone())
+                    .collect();
+                self.log(
+                    &format!("Circuit created: {}", relay_names.join(" → ")),
+                    LogType::Success,
+                );
+                // A spare, so that the next lane does not wait for a build.
+                circuit_manager.refill_spare();
+            }
+            Err(e) => {
+                self.log(&format!("Failed to create circuit: {}", e), LogType::Error);
+                return Err(e);
+            }
+        }
+
+        *self.is_initialized.write().await = true;
+
+        Ok(())
+    }
+
+    /// `future` within `limit` (and until the client is shut down); a
+    /// timeout says which stage it was in.
+    async fn within_stage<T>(
+        &self,
+        limit: Duration,
+        stage: &std::sync::Mutex<&'static str>,
+        future: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        match with_timeout_and_cancellation(limit, "establish_channel", &self.shutdown_token, future)
+            .await
+        {
             Err(TorError::Timeout(message)) => {
                 let stage = *stage.lock().unwrap_or_else(|e| e.into_inner());
                 Err(TorError::Timeout(format!("{message} while {stage}")))
@@ -525,8 +611,11 @@ impl TorClient {
         }
     }
 
-    /// Internal implementation of establish_channel (without timeout wrapper)
-    async fn establish_channel_impl(&self, stage: &std::sync::Mutex<&'static str>) -> Result<()> {
+    /// Connects to the bridge and does the Tor handshake with it.
+    async fn connect_bridge(
+        &self,
+        stage: &std::sync::Mutex<&'static str>,
+    ) -> Result<Arc<tor_proto::channel::Channel>> {
         let set_stage = |now: &'static str| {
             *stage.lock().unwrap_or_else(|e| e.into_inner()) = now;
         };
@@ -652,61 +741,7 @@ impl TorClient {
                 ));
             }
         };
-
-        // Store the channel to keep it alive
-        *self.channel.write().await = Some(chan.clone());
-
-        self.log("Channel established", LogType::Success);
-
-        if !self.directory_manager.has_directory().await {
-            set_stage("fetching the Tor directory through the bridge");
-            self.log(
-                "Fetching the Tor directory through the bridge...",
-                LogType::Info,
-            );
-            if let Err(e) = self
-                .directory_manager
-                .fetch_and_process_consensus(chan)
-                .await
-            {
-                let reason = match self.directory_manager.snapshot_error() {
-                    Some(snapshot) => format!("snapshot: {snapshot}; from the bridge: {e}"),
-                    None => format!("from the bridge: {e}"),
-                };
-                self.log(&format!("Tor directory unusable: {reason}"), LogType::Error);
-                return Err(TorError::Directory(reason));
-            }
-        }
-
-        // Now create the actual circuit through the Tor network
-        set_stage("building the first circuit");
-        self.log("Creating circuit through Tor network...", LogType::Info);
-
-        let circuit_manager = self.circuit_manager.read().await.clone();
-        match circuit_manager.create_circuit().await {
-            Ok(circuit) => {
-                let circuit_info = circuit.read().await;
-                let relay_names: Vec<_> = circuit_info
-                    .relays
-                    .iter()
-                    .map(|r| r.nickname.clone())
-                    .collect();
-                self.log(
-                    &format!("Circuit created: {}", relay_names.join(" → ")),
-                    LogType::Success,
-                );
-                // A spare, so that the next lane does not wait for a build.
-                circuit_manager.refill_spare();
-            }
-            Err(e) => {
-                self.log(&format!("Failed to create circuit: {}", e), LogType::Error);
-                return Err(e);
-            }
-        }
-
-        *self.is_initialized.write().await = true;
-
-        Ok(())
+        Ok(chan)
     }
 
     /// Create Tor channel from a connected stream and spawn the reactor
