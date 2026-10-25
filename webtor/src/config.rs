@@ -96,6 +96,11 @@ pub struct TorClientOptions {
     #[serde(default)]
     pub directory_url: Option<String>,
 
+    /// Congestion control (Vegas) on exit circuits where the consensus asks
+    /// for it and the relays support it; off: Tor's fixed window everywhere.
+    #[serde(default = "default_congestion_control")]
+    pub congestion_control: bool,
+
     /// Optional logging callback function (for WASM bindings)
     #[serde(skip)]
     pub on_log: Option<LogCallback>,
@@ -131,9 +136,14 @@ impl Default for TorClientOptions {
             bridge_fingerprint: None,
             stream_isolation: StreamIsolationPolicy::default(),
             directory_url: None,
+            congestion_control: default_congestion_control(),
             on_log: None,
         }
     }
+}
+
+fn default_congestion_control() -> bool {
+    true
 }
 
 fn default_connection_timeout() -> u64 {
@@ -266,6 +276,11 @@ impl TorClientOptions {
 
     pub fn with_stream_isolation(mut self, policy: StreamIsolationPolicy) -> Self {
         self.stream_isolation = policy;
+        self
+    }
+
+    pub fn with_congestion_control(mut self, enabled: bool) -> Self {
+        self.congestion_control = enabled;
         self
     }
 

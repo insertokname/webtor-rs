@@ -86,6 +86,18 @@ impl IsolationKey {
     pub fn from_string(s: impl Into<String>) -> Self {
         IsolationKey(s.into())
     }
+
+    /// The key of a lane: a group of connections the caller keeps on
+    /// circuits of their own (e.g. lane 0 for chat connections, others for
+    /// bulk transfers, so that a download never delays a message).
+    pub fn lane(lane: u32) -> Self {
+        IsolationKey(format!("lane:{lane}"))
+    }
+
+    /// The lane number, for keys made by [`IsolationKey::lane`].
+    pub fn lane_number(&self) -> Option<u32> {
+        self.0.strip_prefix("lane:")?.parse().ok()
+    }
 }
 
 /// Extract the registrable domain (eTLD+1) from a hostname using the Public Suffix List

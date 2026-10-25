@@ -25,14 +25,14 @@ use futures::stream::LocalBoxStream;
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use hyper::body::{Frame, Incoming, SizeHint};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::cell::Cell;
 use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{debug, warn};
@@ -54,6 +54,8 @@ pub struct HttpsRequest {
     pub headers: HeaderList,
     pub body: Option<RequestBody>,
     pub root_pem: String,
+    /// The circuit lane its connection uses (see `Carrier::connect`).
+    pub lane: u32,
     /// Covers connecting, sending the request and receiving the response
     /// head; with a streamed body, each of those waits instead (see the
     /// module documentation). The response body has its own idle timeout
@@ -77,9 +79,12 @@ impl hyper::body::Body for OutgoingBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>>>> {
         match self.get_mut() {
-            OutgoingBody::Full(bytes) => {
-                Poll::Ready(bytes.take().filter(|b| !b.is_empty()).map(|b| Ok(Frame::data(b))))
-            }
+            OutgoingBody::Full(bytes) => Poll::Ready(
+                bytes
+                    .take()
+                    .filter(|b| !b.is_empty())
+                    .map(|b| Ok(Frame::data(b))),
+            ),
             OutgoingBody::Stream(stream) => stream
                 .poll_next_unpin(cx)
                 .map(|piece| piece.map(|piece| piece.map(Frame::data))),
@@ -95,7 +100,9 @@ impl hyper::body::Body for OutgoingBody {
 
     fn size_hint(&self) -> SizeHint {
         match self {
-            OutgoingBody::Full(bytes) => SizeHint::with_exact(bytes.as_ref().map_or(0, |b| b.len() as u64)),
+            OutgoingBody::Full(bytes) => {
+                SizeHint::with_exact(bytes.as_ref().map_or(0, |b| b.len() as u64))
+            }
             OutgoingBody::Stream(_) => SizeHint::default(),
         }
     }
@@ -112,6 +119,7 @@ struct PoolKey {
     host: String,
     port: u16,
     root_pem: String,
+    lane: u32,
 }
 
 /// One HTTP/1.1 connection: the request handle and the means to end its task.
@@ -181,6 +189,18 @@ impl Pool {
             }
         }
     }
+
+    fn clear_lane(&mut self, lane: u32) {
+        self.idle.retain(|key, list| {
+            if key.lane != lane {
+                return true;
+            }
+            for idle in list.drain(..) {
+                idle.connection.abort.abort();
+            }
+            false
+        });
+    }
 }
 
 /// A response body being received. Dropping it before the end aborts the
@@ -228,7 +248,11 @@ impl HttpsBody {
                     self.cancel();
                     return Err(TorError::network("HTTPS response body: connection aborted"));
                 }
-                Ok(None) if self.expected.is_some_and(|expected| expected != self.received) => {
+                Ok(None)
+                    if self
+                        .expected
+                        .is_some_and(|expected| expected != self.received) =>
+                {
                     let expected = self.expected.unwrap_or_default();
                     self.cancel();
                     return Err(TorError::network(format!(
@@ -322,9 +346,20 @@ impl SignalHttpsClient {
         self.pool.borrow_mut().clear();
     }
 
+    /// New connections of `lane` go over a new circuit: its idle connections
+    /// are dropped and its circuit retired (connections in use keep it).
+    pub async fn renew_lane(&self, lane: u32) {
+        self.pool.borrow_mut().clear_lane(lane);
+        match &self.carrier {
+            Carrier::Tor(client) => client.renew_lane(lane).await,
+            #[cfg(feature = "test-relay")]
+            Carrier::Relay(_) => {}
+        }
+    }
+
     async fn connect(&self, key: &PoolKey) -> Result<Connection> {
         let config = pinned_tls_config(&key.root_pem)?;
-        let tls = connect_tls(&self.carrier, &key.host, key.port, config).await?;
+        let tls = connect_tls(&self.carrier, &key.host, key.port, key.lane, config).await?;
         let (sender, connection) =
             hyper::client::conn::http1::handshake(TokioIo::new(tls.compat()))
                 .await
@@ -390,6 +425,7 @@ impl SignalHttpsClient {
             host: host.clone(),
             port,
             root_pem: request.root_pem.clone(),
+            lane: request.lane,
         };
         let path_and_query = match url.query() {
             Some(query) => format!("{}?{}", url.path(), query),
@@ -502,7 +538,9 @@ impl SignalHttpsClient {
             let status = response.status().as_u16();
             let has_body = method != hyper::Method::HEAD
                 && !matches!(status, 100..=199 | 204 | 304)
-                && !response.headers().contains_key(hyper::header::TRANSFER_ENCODING);
+                && !response
+                    .headers()
+                    .contains_key(hyper::header::TRANSFER_ENCODING);
             let expected = response
                 .headers()
                 .get(hyper::header::CONTENT_LENGTH)

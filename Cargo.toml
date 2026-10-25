@@ -89,7 +89,7 @@ getrandom = { version = "0.2", features = ["js"] }
 
 # Tor-related dependencies (Arti 1.8.0)
 tor-rtcompat = { version = "0.37.0", default-features = false }
-tor-proto = { version = "0.37.0", default-features = false }
+tor-proto = { version = "0.37.0", default-features = false, features = ["flowctl-cc"] }
 tor-netdoc = { version = "0.37.0", default-features = false }
 tor-linkspec = "0.37.0"
 tor-llcrypto = "0.37.0"

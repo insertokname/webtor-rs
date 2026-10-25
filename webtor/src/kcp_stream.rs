@@ -63,6 +63,16 @@ pub struct KcpConfig {
     pub rcv_wnd: u16,
 }
 
+/// The Snowflake client's KCP windows (client/lib/snowflake.go `WindowSize`,
+/// "removes KCP bottlenecks", snowflake#40026). With 128 segments the bridge
+/// could have only ~176 KB in flight to us per round trip; now the SMUX
+/// receive window (4 MiB, smux.rs) is what bounds it.
+const SNOWFLAKE_WINDOW: u16 = 65535;
+
+/// Segments waiting in KCP's send queue (not yet acknowledged) before
+/// writers wait: bounds our memory, independent of the window.
+const SEND_QUEUE_LIMIT: usize = 1024;
+
 impl Default for KcpConfig {
     fn default() -> Self {
         Self {
@@ -72,8 +82,8 @@ impl Default for KcpConfig {
             interval: 100,
             resend: 0,
             nc: true,
-            snd_wnd: 128,
-            rcv_wnd: 128,
+            snd_wnd: SNOWFLAKE_WINDOW,
+            rcv_wnd: SNOWFLAKE_WINDOW,
         }
     }
 }
@@ -121,7 +131,7 @@ impl<S> KcpStream<S> {
             start_time: Instant::now(),
             timer: None,
             write_wakers: Vec::new(),
-            snd_limit: 2 * config.snd_wnd as usize,
+            snd_limit: SEND_QUEUE_LIMIT.min(2 * config.snd_wnd as usize),
             rx_scratch: vec![0u8; 65536],
             rx_pending: Vec::new(),
             rx_pos: 0,
@@ -150,7 +160,9 @@ impl<S> KcpStream<S> {
                 ));
             }
             let wait_ms = self.kcp.check(self.now_ms()).max(1) as u64;
-            self.timer = Some(Box::pin(crate::retry::sleep(Duration::from_millis(wait_ms))));
+            self.timer = Some(Box::pin(crate::retry::sleep(Duration::from_millis(
+                wait_ms,
+            ))));
             // Loop once more to poll the new timer, which registers our waker.
         }
     }
@@ -173,7 +185,11 @@ impl<S: AsyncWrite + Unpin> KcpStream<S> {
                 Poll::Ready(Ok(n)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
-                        format!("transport accepted {} of {} bytes of a KCP packet", n, packet.len()),
+                        format!(
+                            "transport accepted {} of {} bytes of a KCP packet",
+                            n,
+                            packet.len()
+                        ),
                     )))
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

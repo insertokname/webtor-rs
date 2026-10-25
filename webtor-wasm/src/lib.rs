@@ -206,6 +206,14 @@ impl TorClientOptions {
     }
 
     /// Base URL of the cached Tor directory (default `./tor`)
+    /// Congestion control (Vegas) where the consensus asks for it and the
+    /// relays support it (default); false: Tor's fixed window.
+    #[wasm_bindgen(js_name = withCongestionControl)]
+    pub fn with_congestion_control(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.with_congestion_control(enabled);
+        self
+    }
+
     #[wasm_bindgen(js_name = withDirectoryUrl)]
     pub fn with_directory_url(mut self, url: String) -> Self {
         self.inner = self.inner.with_directory_url(url);
@@ -578,6 +586,41 @@ impl TorClient {
             };
 
             Ok(JsValue::from(js_status))
+        })
+    }
+
+    /// Circuit statistics: `{ buildTimesMs: number[] (recent builds, oldest
+    /// first), buildTimeoutMs, abandonedBuilds, circuits: [{ lane, buildMs,
+    /// ageMs }] }` (`lane` is the lane number, or undefined for the spare).
+    #[wasm_bindgen(js_name = circuitStats)]
+    pub fn circuit_stats(&self) -> js_sys::Promise {
+        let client = self.inner.clone();
+        future_to_promise(async move {
+            let client = client.ok_or_else(|| JsTorError::not_initialized().into_js_value())?;
+            let stats = client.circuit_stats().await;
+            let result = js_sys::Object::new();
+            let times = js_sys::Array::new();
+            for took in &stats.build_times {
+                times.push(&JsValue::from(took.as_millis() as f64));
+            }
+            set(&result, "buildTimesMs", &times);
+            set(&result, "buildTimeoutMs", &JsValue::from(stats.build_timeout.as_millis() as f64));
+            set(&result, "abandonedBuilds", &JsValue::from(stats.abandoned_builds));
+            let circuits = js_sys::Array::new();
+            for (key, build, age) in &stats.circuits {
+                let circuit = js_sys::Object::new();
+                let lane = key
+                    .as_deref()
+                    .and_then(|key| webtor::isolation::IsolationKey::from_string(key).lane_number());
+                if let Some(lane) = lane {
+                    set(&circuit, "lane", &JsValue::from(lane));
+                }
+                set(&circuit, "buildMs", &JsValue::from(build.as_millis() as f64));
+                set(&circuit, "ageMs", &JsValue::from(age.as_millis() as f64));
+                circuits.push(&circuit);
+            }
+            set(&result, "circuits", &circuits);
+            Ok(result.into())
         })
     }
 
@@ -1384,6 +1427,8 @@ impl SignalHttps {
     /// `undefined`, a Uint8Array, or a function that streams it (see
     /// request_body_from_js); with a streamed body, `timeout_ms` bounds each
     /// wait (connecting, the next piece being taken, the response head).
+    /// `lane` picks the circuit (default 1; lane 0 is the chat connections'):
+    /// connections of different lanes never share a circuit.
     pub fn request(
         &self,
         method: String,
@@ -1392,6 +1437,7 @@ impl SignalHttps {
         body: JsValue,
         root_pem: String,
         timeout_ms: u32,
+        lane: Option<u32>,
     ) -> js_sys::Promise {
         let inner = self.inner.clone();
         let headers = header_list_from_js(headers);
@@ -1404,6 +1450,7 @@ impl SignalHttps {
                     headers: headers?,
                     body: body?,
                     root_pem,
+                    lane: lane.unwrap_or(webtor::signal_socket::DEFAULT_HTTPS_LANE),
                     timeout: Duration::from_millis(timeout_ms.into()),
                 })
                 .await
@@ -1427,6 +1474,17 @@ impl SignalHttps {
     /// Drop all idle connections.
     pub fn clear(&self) {
         self.inner.clear();
+    }
+
+    /// Resolves once `lane`'s next connections will go over a new circuit
+    /// (its idle connections dropped, its circuit retired).
+    #[wasm_bindgen(js_name = renewLane)]
+    pub fn renew_lane(&self, lane: u32) -> js_sys::Promise {
+        let inner = self.inner.clone();
+        future_to_promise(async move {
+            inner.renew_lane(lane).await;
+            Ok(JsValue::UNDEFINED)
+        })
     }
 }
 

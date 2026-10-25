@@ -1,10 +1,11 @@
 //! Main Tor client implementation
 
-use crate::circuit::{CircuitManager, CircuitStatusInfo};
+use crate::circuit::{CircuitManager, CircuitStatusInfo, STREAM_OPEN_TIMEOUT};
 use crate::config::{BridgeType, LogType, TorClientOptions, SNOWFLAKE_FINGERPRINT_PRIMARY};
 use crate::directory::DirectoryManager;
 use crate::error::{Result, TorError};
 use crate::http::{HttpRequest, HttpResponse, TorHttpClient};
+use crate::isolation::IsolationKey;
 use crate::relay::RelayManager;
 use crate::retry::{with_timeout_and_cancellation, CancellationToken};
 #[cfg(target_arch = "wasm32")]
@@ -72,10 +73,9 @@ impl TorClient {
             );
         }
 
-        let circuit_manager = Arc::new(RwLock::new(CircuitManager::new(
-            relay_manager_arc.clone(),
-            channel.clone(),
-        )));
+        let circuits = CircuitManager::new(relay_manager_arc.clone(), channel.clone());
+        circuits.set_congestion_control(options.congestion_control);
+        let circuit_manager = Arc::new(RwLock::new(circuits));
         let http_client = TorHttpClient::new(circuit_manager.clone(), options.stream_isolation);
 
         let client = Self {
@@ -219,15 +219,17 @@ impl TorClient {
         self.http_client.request(request).await
     }
 
-    /// Update the circuit by creating a new one
-    /// The deadline parameter specifies the maximum time to wait for circuit creation
+    /// New circuits for new streams: retires the circuits in use (streams
+    /// open on them keep working) and makes sure the chat lane has a new
+    /// circuit within `deadline` (usually the spare, at once).
     pub async fn update_circuit(&self, deadline: Duration) -> Result<()> {
         with_timeout_and_cancellation(deadline, "update_circuit", &self.shutdown_token, async {
-            info!("Creating new circuit...");
-            self.log("Creating new circuit...", LogType::Info);
-
-            let circuit_manager = self.circuit_manager.read().await;
-            match circuit_manager.create_circuit().await {
+            let circuit_manager = self.circuit_manager.read().await.clone();
+            circuit_manager.renew(None).await;
+            match circuit_manager
+                .get_circuit_for_isolation_key(Some(IsolationKey::lane(0)))
+                .await
+            {
                 Ok(circuit) => {
                     let circuit_info = circuit.read().await;
                     let relay_names: Vec<_> = circuit_info
@@ -250,13 +252,26 @@ impl TorClient {
         .await
     }
 
+    /// New streams of `lane` go over a new circuit (its current one is
+    /// retired; streams open on it keep working).
+    pub async fn renew_lane(&self, lane: u32) {
+        let circuit_manager = self.circuit_manager.read().await.clone();
+        circuit_manager.renew(Some(&IsolationKey::lane(lane))).await;
+    }
+
+    /// Circuit statistics (build times, circuits in use).
+    pub async fn circuit_stats(&self) -> crate::circuit::CircuitStats {
+        let circuit_manager = self.circuit_manager.read().await.clone();
+        circuit_manager.stats().await
+    }
+
     /// Wait for a circuit to be ready (uses circuit_timeout from options)
     pub async fn wait_for_circuit(&self) -> Result<()> {
         let timeout = self.options.circuit_timeout_duration();
         with_timeout_and_cancellation(timeout, "wait_for_circuit", &self.shutdown_token, async {
             info!("Waiting for circuit to be ready");
 
-            let circuit_manager = self.circuit_manager.read().await;
+            let circuit_manager = self.circuit_manager.read().await.clone();
             let circuit = circuit_manager.get_ready_circuit().await?;
 
             let circuit_read = circuit.read().await;
@@ -370,7 +385,7 @@ impl TorClient {
         }
 
         // Clean up circuits
-        let circuit_manager = self.circuit_manager.write().await;
+        let circuit_manager = self.circuit_manager.read().await.clone();
         if let Err(e) = circuit_manager.cleanup_circuits().await {
             warn!("Error during circuit cleanup: {}", e);
         }
@@ -384,18 +399,65 @@ impl TorClient {
         info!("Tor client closed");
     }
 
-    /// Open a Tor stream to `host:port` (resolved by the exit relay).
+    /// Open a Tor stream to `host:port` (resolved by the exit relay) on
+    /// lane 0's circuit (see [`TorClient::open_stream_on_lane`]).
     pub async fn open_stream(
         &self,
         host: &str,
         port: u16,
     ) -> Result<tor_proto::client::stream::DataStream> {
-        let circuit = {
-            let circuit_manager = self.circuit_manager.read().await;
-            circuit_manager.get_circuit_for_isolation_key(None).await?
-        };
-        let circuit_read = circuit.read().await;
-        circuit_read.begin_stream(host, port).await
+        self.open_stream_on_lane(host, port, 0).await
+    }
+
+    /// Open a Tor stream to `host:port` on the circuit of `lane`: streams of
+    /// different lanes never share a circuit (the app keeps chat
+    /// connections on lane 0 and bulk transfers on others). If the stream
+    /// does not open within [`STREAM_OPEN_TIMEOUT`], or fails, that circuit
+    /// takes no more new streams and the stream is tried once more on
+    /// another one, as Tor does.
+    pub async fn open_stream_on_lane(
+        &self,
+        host: &str,
+        port: u16,
+        lane: u32,
+    ) -> Result<tor_proto::client::stream::DataStream> {
+        let key = IsolationKey::lane(lane);
+        let circuit_manager = self.circuit_manager.read().await.clone();
+        let mut attempt = 1;
+        loop {
+            let circuit = circuit_manager
+                .get_circuit_for_isolation_key(Some(key.clone()))
+                .await?;
+            // Without holding the circuit's lock: opening a stream can take
+            // seconds, and other lanes look at every circuit meanwhile.
+            let tunnel = circuit.read().await.internal_circuit.clone();
+            let opening = async {
+                let tunnel = tunnel.ok_or_else(|| {
+                    TorError::Internal("No internal circuit available".to_string())
+                })?;
+                tunnel
+                    .begin_stream(host, port, None)
+                    .await
+                    .map_err(|e| TorError::Internal(format!("Failed to begin stream: {}", e)))
+            };
+            let result = if attempt == 1 {
+                crate::retry::with_timeout(STREAM_OPEN_TIMEOUT, "opening a stream", opening).await
+            } else {
+                opening.await
+            };
+            match result {
+                Ok(stream) => return Ok(stream),
+                Err(e) if attempt == 1 && !self.shutdown_token.is_cancelled() => {
+                    warn!(
+                        "stream to {}:{} on lane {} failed ({}), trying another circuit",
+                        host, port, lane, e
+                    );
+                    circuit_manager.mark_failed(&circuit).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Resolves once the channel to the bridge has closed (or the client was
@@ -620,7 +682,7 @@ impl TorClient {
         set_stage("building the first circuit");
         self.log("Creating circuit through Tor network...", LogType::Info);
 
-        let circuit_manager = self.circuit_manager.read().await;
+        let circuit_manager = self.circuit_manager.read().await.clone();
         match circuit_manager.create_circuit().await {
             Ok(circuit) => {
                 let circuit_info = circuit.read().await;
@@ -633,6 +695,8 @@ impl TorClient {
                     &format!("Circuit created: {}", relay_names.join(" → ")),
                     LogType::Success,
                 );
+                // A spare, so that the next lane does not wait for a build.
+                circuit_manager.refill_spare();
             }
             Err(e) => {
                 self.log(&format!("Failed to create circuit: {}", e), LogType::Error);

@@ -4,14 +4,9 @@ use crate::directory::VerifiedDirectory;
 use crate::error::{Result, TorError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::str::FromStr;
 use std::sync::Arc;
 use tor_linkspec::{ChanTarget, CircTarget, HasAddrs, OwnedCircTarget};
-use tor_llcrypto::pk::{
-    curve25519::PublicKey as Curve25519PublicKey, ed25519::Ed25519Identity, rsa::RsaIdentity,
-};
 use tor_netdir::{FamilyRules, SubnetConfig};
-use tor_protover::Protocols;
 use tor_relay_selection::{
     RelayExclusion, RelaySelectionConfig, RelaySelector, RelayUsage, TargetPort,
 };
@@ -95,81 +90,6 @@ impl Relay {
         out.ed25519_identity = Some(hex::encode(relay.id().as_bytes()));
         Ok(out)
     }
-
-    /// Convert to OwnedCircTarget for circuit creation
-    pub fn as_circ_target(&self) -> Result<OwnedCircTarget> {
-        let mut builder = OwnedCircTarget::builder();
-
-        {
-            let chan_builder = builder.chan_target();
-
-            // Add addresses
-            if let Ok(ip) = std::net::IpAddr::from_str(&self.address) {
-                chan_builder.addrs(vec![std::net::SocketAddr::new(ip, self.or_port)]);
-            } else {
-                return Err(TorError::Configuration(format!(
-                    "Invalid relay address: {}",
-                    self.address
-                )));
-            }
-
-            // RSA Identity
-            if let Ok(bytes) = hex::decode(&self.fingerprint) {
-                if bytes.len() == 20 {
-                    if let Some(rsa_id) = RsaIdentity::from_bytes(&bytes) {
-                        chan_builder.rsa_identity(rsa_id);
-                    } else {
-                        return Err(TorError::Configuration("Invalid RSA identity".to_string()));
-                    }
-                } else {
-                    return Err(TorError::Configuration(
-                        "Invalid RSA identity length".to_string(),
-                    ));
-                }
-            } else {
-                return Err(TorError::Configuration(
-                    "Invalid RSA identity hex".to_string(),
-                ));
-            }
-
-            // Ed25519 Identity
-            if let Some(ref ed_hex) = self.ed25519_identity {
-                let bytes = hex::decode(ed_hex).map_err(|_| {
-                    TorError::Configuration("Invalid Ed25519 identity hex".to_string())
-                })?;
-                let ed_id = Ed25519Identity::from_bytes(&bytes).ok_or_else(|| {
-                    TorError::Configuration("Invalid Ed25519 identity".to_string())
-                })?;
-                chan_builder.ed_identity(ed_id);
-            }
-        }
-
-        // ntor key
-        let ntor_hex = self
-            .ntor_onion_key
-            .as_deref()
-            .ok_or_else(|| TorError::Configuration("Missing ntor onion key".to_string()))?;
-        if let Ok(bytes) = hex::decode(ntor_hex) {
-            if bytes.len() == 32 {
-                let mut key_bytes = [0u8; 32];
-                key_bytes.copy_from_slice(&bytes);
-                builder.ntor_onion_key(Curve25519PublicKey::from(key_bytes));
-            } else {
-                return Err(TorError::Configuration(
-                    "Invalid ntor key length".to_string(),
-                ));
-            }
-        } else {
-            return Err(TorError::Configuration("Invalid ntor key hex".to_string()));
-        }
-
-        // Protocols
-        builder.protocols(Protocols::default());
-
-        builder
-            .build()
-            .map_err(|e| TorError::Internal(format!("Failed to build circ target: {}", e)))
-    }
 }
 
 /// Relay selection criteria
@@ -232,6 +152,17 @@ impl RelayCriteria {
     }
 }
 
+/// The middle and exit relays of a new circuit, as picked by
+/// [`RelayManager::select_path`].
+pub struct SelectedPath {
+    pub middle: Relay,
+    pub exit: Relay,
+    pub middle_target: OwnedCircTarget,
+    pub exit_target: OwnedCircTarget,
+    /// For extending to the middle and exit (from the consensus).
+    pub params: tor_proto::circuit::CircParameters,
+}
+
 /// Relay manager for selecting appropriate relays
 pub struct RelayManager {
     /// Relays given directly (tests); circuits use `directory`.
@@ -270,7 +201,18 @@ impl RelayManager {
     /// bandwidth-weighted by role, the exit allowing port 443, no two relays
     /// of the circuit in the same family or subnet. Signal's connections are
     /// long-lived, so both relays need the Stable flag.
-    pub fn select_path<CT: ChanTarget>(&self, first_hop: &CT) -> Result<(Relay, Relay)> {
+    ///
+    /// The targets carry what the directory says about each relay, including
+    /// the protocols it supports (ntor v3, congestion control), and the
+    /// circuit parameters come from the consensus, as in Arti's circuit
+    /// manager.
+    /// `congestion_control` false: the fixed window instead (see
+    /// `TorClientOptions::congestion_control`).
+    pub fn select_path<CT: ChanTarget>(
+        &self,
+        first_hop: &CT,
+        congestion_control: bool,
+    ) -> Result<SelectedPath> {
         let dir = self.directory.as_ref().ok_or_else(|| {
             TorError::relay_selection("no verified Tor directory to pick relays from")
         })?;
@@ -306,10 +248,17 @@ impl RelayManager {
         let middle =
             middle.ok_or_else(|| TorError::relay_selection(format!("no middle relay: {info}")))?;
 
-        Ok((
-            Relay::from_netdir(&middle, dir)?,
-            Relay::from_netdir(&exit, dir)?,
-        ))
+        Ok(SelectedPath {
+            middle: Relay::from_netdir(&middle, dir)?,
+            exit: Relay::from_netdir(&exit, dir)?,
+            middle_target: OwnedCircTarget::from_circ_target(&middle),
+            exit_target: OwnedCircTarget::from_circ_target(&exit),
+            params: if congestion_control {
+                crate::circuit::exit_circparams_from_netparams(netdir.params())?
+            } else {
+                crate::circuit::fixed_window_circparams(netdir.params())?
+            },
+        })
     }
 
     /// Select relays matching the given criteria

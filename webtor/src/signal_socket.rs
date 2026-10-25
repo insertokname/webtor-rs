@@ -48,13 +48,23 @@ pub enum Carrier {
     Relay(String),
 }
 
+/// The lane of chat connections (WebSockets to the chat server): circuits of
+/// their own, never shared with bulk transfers.
+pub const CHAT_LANE: u32 = 0;
+/// The lane of HTTPS requests unless the caller picks another.
+pub const DEFAULT_HTTPS_LANE: u32 = 1;
+
 impl Carrier {
-    /// Opens a byte stream to `host:port` (the exit relay resolves the name).
-    pub async fn connect(&self, host: &str, port: u16) -> Result<BoxedCarrierStream> {
+    /// Opens a byte stream to `host:port` (the exit relay resolves the name)
+    /// on `lane`'s circuit (see `TorClient::open_stream_on_lane`).
+    pub async fn connect(&self, host: &str, port: u16, lane: u32) -> Result<BoxedCarrierStream> {
         match self {
-            Carrier::Tor(client) => Ok(Box::pin(client.open_stream(host, port).await?)),
+            Carrier::Tor(client) => Ok(Box::pin(
+                client.open_stream_on_lane(host, port, lane).await?,
+            )),
             #[cfg(feature = "test-relay")]
             Carrier::Relay(relay) => {
+                let _ = lane;
                 let mut url = url::Url::parse(relay)
                     .map_err(|e| TorError::Network(format!("invalid relay URL: {}", e)))?;
                 url.query_pairs_mut()
@@ -100,9 +110,10 @@ pub async fn connect_tls(
     carrier: &Carrier,
     host: &str,
     port: u16,
+    lane: u32,
     config: Arc<ClientConfig>,
 ) -> Result<SignalTlsStream> {
-    let stream = carrier.connect(host, port).await?;
+    let stream = carrier.connect(host, port, lane).await?;
     let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
         .map_err(|e| TorError::tls(format!("invalid server name {}: {}", host, e)))?;
     futures_rustls::TlsConnector::from(config)
@@ -164,7 +175,7 @@ pub async fn open(
     let config = pinned_tls_config(root_pem)?;
 
     crate::retry::with_timeout(timeout, "WebSocket connect", async move {
-        let tls = connect_tls(carrier, &host, port, config).await?;
+        let tls = connect_tls(carrier, &host, port, CHAT_LANE, config).await?;
         match async_tungstenite::client_async(request, tls).await {
             Ok((socket, response)) => Ok(Upgrade::Open {
                 socket,

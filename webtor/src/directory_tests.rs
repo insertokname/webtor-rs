@@ -394,7 +394,7 @@ fn drops_tampered_microdescriptors() {
     assert_eq!(dir.summary.dropped_microdescriptors, 1);
     assert_eq!(dir.summary.usable_relays, baseline.usable_relays - 1);
     assert!(dir.netdir.relays().all(|r| {
-        use tor_linkspec::CircTarget;
+        use tor_linkspec::{CircTarget, HasRelayIds};
         r.ntor_onion_key().as_bytes() != &[0u8; 32]
     }));
     eprintln!("tampered microdescriptor dropped: {:?}", dir.summary);
@@ -432,15 +432,54 @@ fn picks_paths_from_the_real_snapshot() {
         .build()
         .unwrap();
     let mut exits = HashSet::new();
+    let mut negotiate_cc = 0;
     for _ in 0..50 {
-        let (middle, exit) = manager.select_path(&bridge).unwrap();
+        let path = manager.select_path(&bridge, true).unwrap();
+        let (middle, exit) = (&path.middle, &path.exit);
         assert_ne!(middle.fingerprint, exit.fingerprint);
+        // The targets carry the relays' real protocol lists: ntor v3 and
+        // congestion control (FlowCtrl=2) where the relay has them.
+        use tor_linkspec::{CircTarget, HasRelayIds};
+        use tor_protover::named;
+        assert_eq!(
+            hex::encode(path.exit_target.rsa_identity().unwrap().as_bytes()),
+            exit.fingerprint
+        );
+        let protocols = path.exit_target.protovers();
+        if protocols.supports_named_subver(named::RELAY_NTORV3)
+            && protocols.supports_named_subver(named::FLOWCTRL_CC)
+        {
+            negotiate_cc += 1;
+        }
         let exit_id = RsaIdentity::from_hex(&exit.fingerprint).unwrap();
         let relay = dir.netdir.by_id(&exit_id).unwrap();
         assert!(relay.low_level_details().supports_exit_port_ipv4(443));
         assert!(exit.flags.contains("Stable") && middle.flags.contains("Stable"));
-        exits.insert(exit.fingerprint);
+        exits.insert(exit.fingerprint.clone());
     }
+    eprintln!("{negotiate_cc} of 50 exits support ntor v3 and congestion control");
+    assert!(
+        negotiate_cc > 40,
+        "{negotiate_cc} of 50 exits support ntor v3 and congestion control"
+    );
+    assert!(matches!(
+        manager
+            .select_path(&bridge, true)
+            .unwrap()
+            .params
+            .ccontrol
+            .alg(),
+        tor_proto::ccparams::Algorithm::Vegas(_)
+    ));
+    assert!(matches!(
+        manager
+            .select_path(&bridge, false)
+            .unwrap()
+            .params
+            .ccontrol
+            .alg(),
+        tor_proto::ccparams::Algorithm::FixedWindow(_)
+    ));
     // Weighted random choice over the whole network, not a fixed few.
     eprintln!("{} distinct exits in 50 paths", exits.len());
     assert!(
