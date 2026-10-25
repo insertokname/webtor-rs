@@ -39,6 +39,12 @@ use tracing::{debug, warn};
 
 /// Idle connections are dropped after this long (servers close them anyway).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(50);
+/// How long a request that is safe to repeat waits for its response head on
+/// a reused connection before it is sent again on a new circuit: a circuit
+/// can die while its connections sit in the pool (its exit stops answering),
+/// and a connection on it would otherwise hold the request until its
+/// timeout. As long as opening a stream may take (circuit::STREAM_OPEN_TIMEOUT).
+const REUSED_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_IDLE_PER_KEY: usize = 4;
 
 /// A request body: none, in memory, or pulled piece by piece.
@@ -515,7 +521,28 @@ impl SignalHttpsClient {
                 }
                 return Err(TorError::network("HTTPS connection closed"));
             }
-            let response = match connection.sender.send_request(build()?).await {
+            let sending = connection.sender.send_request(build()?);
+            let sent = if was_reused && idempotent {
+                match crate::retry::with_timeout(REUSED_RESPONSE_TIMEOUT, "response", async {
+                    Ok(sending.await)
+                })
+                .await
+                {
+                    Ok(sent) => sent,
+                    Err(_) => {
+                        warn!(
+                            "reused HTTPS connection to {} gave no answer in {:?}, retrying on a new circuit",
+                            host, REUSED_RESPONSE_TIMEOUT
+                        );
+                        fail(connection);
+                        self.renew_lane(key.lane).await;
+                        continue;
+                    }
+                }
+            } else {
+                sending.await
+            };
+            let response = match sent {
                 Ok(response) => response,
                 Err(e)
                     if was_reused
