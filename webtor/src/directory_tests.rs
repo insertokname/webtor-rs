@@ -406,12 +406,16 @@ fn rejects_too_few_microdescriptors() {
         eprintln!("WEBTOR_TEST_DIRECTORY not set: skipped");
         return;
     };
-    // A tenth of the microdescriptors cannot build enough paths.
+    // A tenth of the microdescriptors cannot build enough paths. Each one
+    // starts with an `onion-key` line (with a TAP key before consensus
+    // method 37, bare since).
     let mds = docs.microdescs.take().unwrap();
     let starts: Vec<usize> = mds
-        .match_indices("onion-key\n-----BEGIN")
+        .match_indices("onion-key\n")
         .map(|(i, _)| i)
+        .filter(|&i| i == 0 || mds.as_bytes()[i - 1] == b'\n')
         .collect();
+    assert!(starts.len() > 1000, "{} microdescriptors", starts.len());
     docs.microdescs = Some(mds[..starts[starts.len() / 10]].to_string());
     assert_rejected(&docs, "a tenth of the microdescriptors", |e| {
         matches!(e, DirectoryError::NotEnoughMicrodescriptors { .. })
