@@ -63,20 +63,6 @@ impl TorClient {
 
         let directory_manager = Arc::new(DirectoryManager::new(relay_manager_arc.clone()));
 
-        // The verified directory snapshot served with the page. If it cannot
-        // be used, the directory is fetched through the bridge once the
-        // channel is up (establish_channel).
-        info!("Loading the Tor directory snapshot...");
-        if let Err(e) = directory_manager
-            .load_cached_consensus(options.directory_url.as_deref())
-            .await
-        {
-            warn!(
-                "Tor directory snapshot not usable, will fetch through the bridge: {}",
-                e
-            );
-        }
-
         let circuits = CircuitManager::new(relay_manager_arc.clone(), channel.clone());
         circuits.set_congestion_control(options.congestion_control);
         let circuit_manager = Arc::new(RwLock::new(circuits));
@@ -93,20 +79,41 @@ impl TorClient {
             shutdown_token: CancellationToken::new(),
         };
 
+        // The verified directory snapshot served with the page. If it cannot
+        // be used, the directory is fetched through the bridge once the
+        // channel is up (establish_channel).
+        let directory_manager = client.directory_manager.clone();
+        let directory_url = options.directory_url.clone();
+        let load_snapshot = async move {
+            info!("Loading the Tor directory snapshot...");
+            if let Err(e) = directory_manager
+                .load_cached_consensus(directory_url.as_deref())
+                .await
+            {
+                warn!(
+                    "Tor directory snapshot not usable, will fetch through the bridge: {}",
+                    e
+                );
+            }
+        };
+
         // Create initial circuit if requested
         if options.create_circuit_early {
             info!("Establishing connection early");
 
-            // Establish the channel
+            // Establish the channel, connecting to the bridge while the
+            // snapshot loads.
             info!("TorClient::new: calling establish_channel");
             // Fail loudly: callers get the real reason instead of a later
             // "Channel not established" from wait_for_circuit.
-            if let Err(e) = client.establish_channel().await {
+            if let Err(e) = client.establish_channel_while(load_snapshot).await {
                 error!("Failed to establish channel: {}", e);
                 client.close().await;
                 return Err(e);
             }
             info!("TorClient::new: establish_channel returned");
+        } else {
+            load_snapshot.await;
         }
 
         info!("TorClient::new RETURNING");
@@ -515,6 +522,17 @@ impl TorClient {
     /// the page is not usable) DIRECTORY_FETCH_TIMEOUT, so that a slow bridge
     /// that has just sent the directory is not given up on.
     async fn establish_channel(&self) -> Result<()> {
+        self.establish_channel_while(async {}).await
+    }
+
+    /// Connects to the bridge while `directory` runs (loading the directory
+    /// snapshot: its download and verification overlap the bridge
+    /// connection and the handshake), then fetches the directory through
+    /// the bridge if there still is none, and builds the first circuit.
+    async fn establish_channel_while(
+        &self,
+        directory: impl std::future::Future<Output = ()>,
+    ) -> Result<()> {
         let timeout = self.options.connection_timeout_duration();
         // How far it got, for the timeout's message.
         let stage = std::sync::Mutex::new("connecting to the bridge");
@@ -522,9 +540,11 @@ impl TorClient {
             *stage.lock().unwrap_or_else(|e| e.into_inner()) = now;
         };
 
-        let chan = self
-            .within_stage(timeout, &stage, self.connect_bridge(&stage))
-            .await?;
+        let (chan, ()) = futures::join!(
+            self.within_stage(timeout, &stage, self.connect_bridge(&stage)),
+            directory
+        );
+        let chan = chan?;
 
         // Store the channel to keep it alive
         *self.channel.write().await = Some(chan.clone());

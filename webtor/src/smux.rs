@@ -344,8 +344,10 @@ impl<S> SmuxStream<S> {
                 }
                 self.check_keepalive()?;
             }
-            self.keepalive_timer =
-                Some(Box::pin(crate::retry::sleep(self.keepalive_check_interval)));
+            // Not throttled with the page's timers when it is hidden.
+            self.keepalive_timer = Some(Box::pin(crate::timer::unthrottled_sleep(
+                self.keepalive_check_interval,
+            )));
             // Loop once more to poll the new timer, which registers our waker.
         }
     }

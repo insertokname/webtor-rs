@@ -19,6 +19,7 @@ pub mod snowflake;
 pub mod snowflake_broker;
 pub mod snowflake_ws;
 pub mod time;
+pub mod timer;
 pub mod tls;
 pub mod turbo;
 pub mod wasm_runtime;

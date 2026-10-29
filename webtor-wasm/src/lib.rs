@@ -95,6 +95,15 @@ pub fn set_log_callback(callback: js_sys::Function) {
     });
 }
 
+/// Timer functions that are not throttled while the page is hidden (a
+/// dedicated worker's timers): `set(callback, ms)` returns a handle,
+/// `clear(handle)` cancels it. The keepalives of the bridge connection use
+/// them (webtor::timer); without them they use the page's own timers.
+#[wasm_bindgen(js_name = setTimerFunctions)]
+pub fn set_timer_functions(set: js_sys::Function, clear: js_sys::Function) {
+    webtor::timer::set_functions(set, clear);
+}
+
 /// Enable or disable debug-level logging
 #[wasm_bindgen(js_name = setDebugEnabled)]
 pub fn set_debug_enabled(enabled: bool) {
