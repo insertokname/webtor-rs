@@ -1,3 +1,7 @@
+# VIBECODED BULLSHIT AHEAD!
+
+This was built for personal purposes and if you plan on using it too keep in mind it's pure unfiltered slop
+
 # webtor-rs
 
 [![CI](https://github.com/privacy-ethereum/webtor-rs/actions/workflows/test.yml/badge.svg)](https://github.com/privacy-ethereum/webtor-rs/actions/workflows/test.yml)
