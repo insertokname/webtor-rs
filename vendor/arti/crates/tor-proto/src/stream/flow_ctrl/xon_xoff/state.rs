@@ -150,8 +150,11 @@ impl FlowCtrlHooks for XonXoffFlowCtrl {
         let rate = match xon.kbps_ewma() {
             XonKbpsEwma::Limited(rate_kbps) => {
                 let rate_kbps = u64::from(rate_kbps.get());
-                // convert from kbps to bytes/s
-                StreamRateLimit::new_bytes_per_sec(rate_kbps * 1000 / 8)
+                // The rate is in kilobytes/s (1000 bytes/s), not kilobits/s: C tor computes it as
+                // bytes per millisecond (compute_drain_rate()) and applies `rate * 1000` bytes/s
+                // (circuit_process_stream_xon()). Taking it as kilobits limited uploads to 1/8 of
+                // what the exit drains. Fixed the same way in upstream Arti (tor-proto 0.47).
+                StreamRateLimit::new_bytes_per_sec(rate_kbps * 1000)
             }
             XonKbpsEwma::Unlimited => StreamRateLimit::MAX,
         };
