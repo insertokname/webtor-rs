@@ -7,7 +7,7 @@
 use super::{
     CongestionControlAlgorithm, CongestionSignals, CongestionWindow, State,
     params::{Algorithm, VegasParams},
-    rtt::RoundtripTimeEstimator,
+    rtt::{ClockStall, RoundtripTimeEstimator},
 };
 use crate::Result;
 
@@ -60,7 +60,8 @@ impl BdpEstimator {
             self.bdp = cwnd
                 .get()
                 .saturating_mul(min_rtt_usec)
-                .saturating_div(ewma_rtt_usec);
+                // Careful here to ensure we avoid divide-by-zero panic.
+                .saturating_div(ewma_rtt_usec.max(1));
         }
     }
 }
@@ -156,11 +157,20 @@ impl CongestionControlAlgorithm for Vegas {
         state: &mut State,
         rtt: &mut RoundtripTimeEstimator,
         signals: CongestionSignals,
+        clock_stall: ClockStall,
     ) -> Result<()> {
         // Update the countdown until we need to update the congestion window.
         self.num_sendme_until_cwnd_update = self.num_sendme_until_cwnd_update.saturating_sub(1);
         // We just got a SENDME so decrement the amount of expected SENDMEs for a cwnd.
         self.num_sendme_per_cwnd = self.num_sendme_per_cwnd.saturating_sub(1);
+
+        // Do not update anything (other than `next_cc_event` and `next_cwnd_event` counters above)
+        // if we detected a clock stall or jump, as per [CLOCK_HEURISTICS].
+        if clock_stall == ClockStall::Detected {
+            // Update the inflight now that we have a SENDME and return early.
+            self.num_inflight = self.num_inflight.saturating_sub(self.cwnd.sendme_inc());
+            return Ok(());
+        }
 
         // From here, C-tor proceeds to update the RTT and BDP (circuit estimates). The RTT is
         // updated before this is called and so the "rtt" object is up to date with the latest. As
@@ -444,9 +454,10 @@ pub(crate) mod test {
             assert!(ret.is_ok());
 
             let signals = CongestionSignals::new(p.or_conn_blocked_in, 0);
-            let ret = self
-                .vegas
-                .sendme_received(&mut self.state, &mut self.rtt, signals);
+            let clock_stall = ClockStall::NotDetected;
+            let ret =
+                self.vegas
+                    .sendme_received(&mut self.state, &mut self.rtt, signals, clock_stall);
             assert!(ret.is_ok());
 
             assert_eq!(self.rtt.ewma_rtt_usec().unwrap(), p.ewma_rtt_usec_out);
